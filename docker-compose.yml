@@ -1,0 +1,44 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: rhein_backend
+      POSTGRES_PASSWORD: strongpassword
+      POSTGRES_DB: rhein-db
+    ports:
+      - "5433:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U rhein_backend -d rhein-db"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  backend:
+    build: .
+    ports:
+      - "3001:3001"
+    env_file:
+      - .env
+    environment:
+      DATABASE_HOST: postgres
+      DATABASE_PORT: 5432
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - default
+      - splice_network
+
+volumes:
+  pgdata:
+
+networks:
+  default:
+    driver: bridge
+  splice_network:
+    external: true
+    name: splice-validator_splice_validator

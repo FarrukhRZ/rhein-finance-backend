@@ -1,0 +1,19 @@
+[Unit]
+Description=Rhein Finance Backend (NestJS)
+After=network.target postgresql.service docker.service
+Wants=network.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/rhein-app
+ExecStart=/usr/bin/node dist/main.js
+Restart=on-failure
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=rhein-backend
+Environment=NODE_ENV=production
+
+[Install]
+WantedBy=multi-user.target
