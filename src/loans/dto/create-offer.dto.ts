@@ -3,11 +3,6 @@ import { ApiProperty } from '@nestjs/swagger';
 import { Transform } from 'class-transformer';
 
 export class CreateOfferDto {
-  @ApiProperty({ example: 'Alice::1220abc...', description: 'DAML party ID' })
-  @IsString()
-  @IsNotEmpty()
-  partyId: string;
-
   @ApiProperty({ enum: ['BorrowerBid', 'LenderAsk'], example: 'BorrowerBid' })
   @IsEnum(['BorrowerBid', 'LenderAsk'])
   offerType: 'BorrowerBid' | 'LenderAsk';

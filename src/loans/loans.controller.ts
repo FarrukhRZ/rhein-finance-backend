@@ -42,7 +42,7 @@ export class LoansController {
   @ApiResponse({ status: 201, description: 'Loan offer created successfully' })
   @ApiResponse({ status: 400, description: 'Invalid input or party ID' })
   async createOffer(@CurrentUser() user: User, @Body() dto: CreateOfferDto) {
-    const result = await this.loansService.createOffer(dto, user.rawToken);
+    const result = await this.loansService.createOffer({ ...dto, partyId: user.partyId }, user.rawToken);
     return { success: true, data: result };
   }
 
@@ -56,7 +56,7 @@ export class LoansController {
     @Param('contractId') contractId: string,
     @Body() dto: AcceptOfferDto
   ) {
-    const result = await this.loansService.acceptOffer(contractId, dto.partyId, dto.offer, user.rawToken);
+    const result = await this.loansService.acceptOffer(contractId, user.partyId, dto.offer, user.rawToken);
     return { success: true, data: result };
   }
 
@@ -84,7 +84,7 @@ export class LoansController {
   ) {
     const result = await this.loansService.repayLoan(
       contractId,
-      dto.partyId,
+      user.partyId,
       dto.repaymentAmount,
       user.rawToken,
     );
@@ -101,7 +101,7 @@ export class LoansController {
     @Param('contractId') contractId: string,
     @Body() dto: DefaultLoanDto
   ) {
-    const result = await this.loansService.defaultLoan(contractId, dto.partyId, dto.claimDate, user.rawToken);
+    const result = await this.loansService.defaultLoan(contractId, user.partyId, dto.claimDate, user.rawToken);
     return { success: true, data: result };
   }
 

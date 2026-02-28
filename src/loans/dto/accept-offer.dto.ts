@@ -1,12 +1,7 @@
-import { IsString, IsNotEmpty, IsObject } from 'class-validator';
+import { IsNotEmpty, IsObject } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 
 export class AcceptOfferDto {
-  @ApiProperty({ example: 'Bob::1220xyz...', description: 'Acceptor party ID' })
-  @IsString()
-  @IsNotEmpty()
-  partyId: string;
-
   @ApiProperty({
     description: 'The full loan offer object',
     example: {
