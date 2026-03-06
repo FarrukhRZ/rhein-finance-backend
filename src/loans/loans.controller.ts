@@ -1,5 +1,5 @@
-import { Controller, Get, Post, Body, Param, Query } from '@nestjs/common';
-import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery, ApiBearerAuth } from '@nestjs/swagger';
+import { Controller, Get, Post, Body, Param, ForbiddenException } from '@nestjs/common';
+import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBearerAuth } from '@nestjs/swagger';
 import { LoansService } from './loans.service';
 import { Public } from '../auth/decorators/public.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
@@ -28,12 +28,11 @@ export class LoansController {
   }
 
   @Get('offers')
-  @ApiOperation({ summary: 'Get loan offers for a specific party' })
-  @ApiQuery({ name: 'partyId', example: 'Alice::1220abc...', description: 'DAML party ID' })
+  @ApiOperation({ summary: 'Get loan offers for the authenticated party' })
   @ApiResponse({ status: 200, description: 'Returns loan offers for the party' })
-  @ApiResponse({ status: 400, description: 'Invalid party ID or missing partyId' })
-  async getOffers(@Query('partyId') partyId: string) {
-    const offers = await this.loansService.getOffers(partyId);
+  @ApiResponse({ status: 400, description: 'Invalid party ID' })
+  async getOffers(@CurrentUser() user: User) {
+    const offers = await this.loansService.getOffers(user.partyId);
     return { success: true, data: offers };
   }
 
@@ -56,6 +55,9 @@ export class LoansController {
     @Param('contractId') contractId: string,
     @Body() dto: AcceptOfferDto
   ) {
+    if (dto.offer?.payload?.initiator === user.partyId) {
+      throw new ForbiddenException('Cannot accept your own loan offer');
+    }
     const result = await this.loansService.acceptOffer(contractId, user.partyId, dto.offer, user.rawToken);
     return { success: true, data: result };
   }
@@ -63,12 +65,11 @@ export class LoansController {
   // ========== LOAN ENDPOINTS ==========
 
   @Get('loans')
-  @ApiOperation({ summary: 'Get active loans for a specific party' })
-  @ApiQuery({ name: 'partyId', example: 'Alice::1220abc...', description: 'DAML party ID' })
+  @ApiOperation({ summary: 'Get active loans for the authenticated party' })
   @ApiResponse({ status: 200, description: 'Returns active loans' })
   @ApiResponse({ status: 400, description: 'Invalid party ID' })
-  async getLoans(@Query('partyId') partyId: string) {
-    const loans = await this.loansService.getActiveLoans(partyId);
+  async getLoans(@CurrentUser() user: User) {
+    const loans = await this.loansService.getActiveLoans(user.partyId);
     return { success: true, data: loans };
   }
 
@@ -107,14 +108,12 @@ export class LoansController {
 
   // ========== BALANCE ENDPOINTS ==========
 
-  @Public()
-  @Get('balances/:party')
-  @ApiOperation({ summary: 'Get token balances for a party' })
-  @ApiParam({ name: 'party', example: 'Alice::1220abc...', description: 'DAML party ID' })
+  @Get('balances')
+  @ApiOperation({ summary: 'Get token balances for the authenticated party' })
   @ApiResponse({ status: 200, description: 'Returns USDC and CC balances' })
   @ApiResponse({ status: 400, description: 'Invalid party ID' })
-  async getBalances(@Param('party') partyId: string) {
-    const balances = await this.loansService.getBalances(partyId);
+  async getBalances(@CurrentUser() user: User) {
+    const balances = await this.loansService.getBalances(user.partyId);
     return { success: true, data: balances };
   }
 

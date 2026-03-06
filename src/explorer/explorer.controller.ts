@@ -1,4 +1,4 @@
-import { Controller, Get, Param, Query } from '@nestjs/common';
+import { Controller, Get, Param, Query, ParseIntPipe, DefaultValuePipe } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery } from '@nestjs/swagger';
 import { ExplorerService } from './explorer.service';
 import { Public } from '../auth/decorators/public.decorator';
@@ -13,13 +13,15 @@ export class ExplorerController {
   @ApiOperation({ summary: 'Get transaction stream (recent transactions)' })
   @ApiQuery({ name: 'partyId', example: 'Alice::1220abc...', description: 'DAML party ID' })
   @ApiQuery({ name: 'offset', required: false, description: 'Pagination offset' })
+  @ApiQuery({ name: 'limit', required: false, description: 'Max results (default 100, max 100)' })
   @ApiResponse({ status: 200, description: 'Returns transaction stream' })
   @ApiResponse({ status: 400, description: 'Invalid party ID' })
   async getTransactions(
     @Query('partyId') partyId: string,
-    @Query('offset') offset?: string
+    @Query('offset') offset?: string,
+    @Query('limit', new DefaultValuePipe(100), ParseIntPipe) limit?: number,
   ) {
-    const transactions = await this.explorerService.getTransactions(partyId, offset);
+    const transactions = await this.explorerService.getTransactions(partyId, offset, limit);
     return { success: true, data: transactions };
   }
 

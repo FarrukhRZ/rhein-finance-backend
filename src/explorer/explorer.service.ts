@@ -16,9 +16,9 @@ export class ExplorerService {
     }
   }
 
-  async getTransactions(partyId: string, offset?: string) {
+  async getTransactions(partyId: string, offset?: string, limit = 100) {
     this.ensureValidPartyId(partyId);
-    return this.damlService.getTransactionStream(partyId, offset);
+    return this.damlService.getTransactionStream(partyId, offset, Math.min(limit, 100));
   }
 
   async getTransactionById(partyId: string, txId: string) {

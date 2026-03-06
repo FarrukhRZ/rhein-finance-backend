@@ -1014,9 +1014,30 @@ export class DamlService {
   // TRANSACTION EXPLORER
   // ============================================================================
 
-  async getTransactionStream(partyId: string, fromOffset?: string): Promise<Transaction[]> {
+  private async getLedgerEnd(): Promise<number> {
+    const token = await this.getLedgerApiToken();
+    const response = await this.customFetch(`${this.jsonApiUrl}/v2/state/ledger-end`, {
+      method: 'GET',
+      headers: { 'Authorization': `Bearer ${token}` },
+    });
+    if (!response.ok) return 0;
+    const data = await response.json();
+    // Canton v2 returns { offset: number } or { ledgerEnd: { absolute: number } }
+    return data?.offset ?? data?.ledgerEnd?.absolute ?? data?.ledgerEnd ?? 0;
+  }
+
+  async getTransactionStream(partyId: string, fromOffset?: string, limit = 100): Promise<Transaction[]> {
+    // Use endInclusive to bound the query — Canton has a node-level 200-element cap
+    // and rejects unbounded requests when the party has >200 transactions.
+    const ledgerEnd = await this.getLedgerEnd();
+    const endInclusive = ledgerEnd;
+    const beginExclusive = fromOffset
+      ? parseInt(fromOffset)
+      : Math.max(0, ledgerEnd - limit);
+
     const body = {
-      beginExclusive: fromOffset ? parseInt(fromOffset) : 0,
+      beginExclusive,
+      endInclusive,
       filter: {
         filtersByParty: {
           [partyId]: {
@@ -1113,7 +1134,7 @@ export class DamlService {
       });
     }
 
-    return transactions.slice(0, 50);
+    return transactions;
   }
 
   async getTransactionById(partyId: string, transactionId: string): Promise<Transaction | null> {
