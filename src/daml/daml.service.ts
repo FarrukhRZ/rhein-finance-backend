@@ -30,9 +30,15 @@ export class DamlService {
   private readonly auth0ClientId: string;
   private readonly auth0ClientSecret: string;
   private readonly ledgerApiAuthAudience: string;
+  private readonly usdcxAdminPartyId: string;
+  private readonly usdcxUtilityBackendUrl: string;
+  private readonly usdcxBridgeOperatorPartyId: string;
+  private readonly usdcxUtilityOperatorPartyId: string;
 
   // Cached Auth0 tokens (keyed by audience)
   private tokenCache: Map<string, { token: string; expiresAt: number }> = new Map();
+  // Cached USDCx Burn Mint Factory context (changes infrequently)
+  private usdcxContextCache: { factoryId: string; choiceContextData: any; disclosedContracts: any[]; cachedAt: number } | null = null;
 
   constructor(private configService: ConfigService) {
     this.jsonApiUrl = this.configService.get('JSON_API_URL') || 'http://172.18.0.5:7575';
@@ -49,6 +55,10 @@ export class DamlService {
     this.auth0ClientId = this.configService.get('AUTH0_CLIENT_ID') || '';
     this.auth0ClientSecret = this.configService.get('AUTH0_CLIENT_SECRET') || '';
     this.ledgerApiAuthAudience = this.configService.get('LEDGER_API_AUTH_AUDIENCE') || 'https://canton.network.global';
+    this.usdcxAdminPartyId = this.configService.get('USDCX_ADMIN_PARTY_ID') || '';
+    this.usdcxUtilityBackendUrl = this.configService.get('USDCX_UTILITY_BACKEND_URL') || 'https://api.utilities.digitalasset-staging.com';
+    this.usdcxBridgeOperatorPartyId = this.configService.get('USDCX_BRIDGE_OPERATOR_PARTY_ID') || '';
+    this.usdcxUtilityOperatorPartyId = this.configService.get('USDCX_UTILITY_OPERATOR_PARTY_ID') || '';
   }
 
   // ============================================================================
@@ -1358,5 +1368,223 @@ export class DamlService {
    */
   async rejectTransferOffer(offerId: string, userToken?: string): Promise<any> {
     return this.rejectTransfer(offerId, userToken);
+  }
+
+  // ============================================================================
+  // USDCx (Canton Universal Bridge - CIP-56 Token Standard)
+  // ============================================================================
+
+  /**
+   * Get Burn Mint Factory context from the Canton Utilities API.
+   * Cached for 1 hour since these values change infrequently.
+   * Required for mint (deposit) and burn (withdrawal) operations.
+   */
+  async getUSDCxBurnMintContext(partyId: string): Promise<{
+    factoryId: string;
+    choiceContextData: any;
+    disclosedContracts: any[];
+  }> {
+    if (this.usdcxContextCache && Date.now() - this.usdcxContextCache.cachedAt < 60 * 60 * 1000) {
+      return this.usdcxContextCache;
+    }
+
+    const response = await this.customFetch(
+      `${this.usdcxUtilityBackendUrl}/api/utilities/v0/registry/burn-mint-instruction/v0/burn-mint-factory`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          instrumentId: { admin: this.usdcxAdminPartyId, id: 'USDCx' },
+          inputHoldingCids: [],
+          outputs: [{ owner: partyId, amount: '0' }],
+        }),
+      },
+    );
+
+    if (!response.ok) {
+      const text = await response.text();
+      throw new Error(`USDCx Burn Mint Factory API error (${response.status}): ${text}`);
+    }
+
+    const data = await response.json();
+    // Response format: { factoryId, choiceContext: { choiceContextData, disclosedContracts } }
+    const context = {
+      factoryId: data.factoryId,
+      choiceContextData: data.choiceContext?.choiceContextData,
+      disclosedContracts: data.choiceContext?.disclosedContracts || [],
+      cachedAt: Date.now(),
+    };
+
+    this.usdcxContextCache = context;
+    return context;
+  }
+
+  /**
+   * Query USDCx holdings for a party from the DAML ledger.
+   * Uses the Utility.Registry.Holding.V0.Holding template from the CUB utilities DAR.
+   */
+  async getUSDCxHoldings(partyId: string): Promise<any[]> {
+    const holdingTemplateId = 'dd3a9f2d51cc4c52d9ec2e1d7ff235298dcfb3afd1d50ab44328b1aaa9a18587:Utility.Registry.Holding.V0.Holding:Holding';
+    try {
+      const contracts = await this.queryContracts([holdingTemplateId], [partyId]);
+      return contracts.filter(
+        c =>
+          c.payload?.instrument?.id === 'USDCx' &&
+          c.payload?.owner === partyId,
+      );
+    } catch (err) {
+      console.log(`[USDCx] Holdings query failed (${(err as Error).message}), returning empty`);
+      return [];
+    }
+  }
+
+  /**
+   * Get total USDCx balance for a party.
+   * Utility holdings don't have a lock field — returns total as available.
+   */
+  async getUSDCxBalance(partyId: string): Promise<{ available: number; total: number }> {
+    const holdings = await this.getUSDCxHoldings(partyId);
+    const total = holdings.reduce((sum, h) => sum + parseFloat(h.payload?.amount || '0'), 0);
+    return { available: total, total };
+  }
+
+  /**
+   * Transfer USDCx to another party using the CUB token-standard transfer flow:
+   *   1. Query sender's USDCx holding CIDs
+   *   2. Call the utility backend transfer-factory endpoint to get factory context
+   *   3. Submit DAML ExerciseCommand TransferFactory_Transfer with user's token
+   */
+  async transferUSDCx(senderPartyId: string, recipientPartyId: string, amount: number, userToken?: string): Promise<any> {
+    console.log(`[USDCx] Transferring ${amount} USDCx: ${senderPartyId} → ${recipientPartyId}`);
+
+    // Step 1: Get sender's holding CIDs
+    const holdings = await this.getUSDCxHoldings(senderPartyId);
+    const totalBalance = holdings.reduce((s, h) => s + parseFloat(h.payload?.amount || '0'), 0);
+    if (totalBalance < amount) {
+      throw new Error(`Insufficient USDCx balance. Need ${amount}, have ${totalBalance}`);
+    }
+
+    // Pick enough holdings to cover the amount
+    let remaining = amount;
+    const inputHoldingCids: string[] = [];
+    for (const h of holdings) {
+      if (remaining <= 0) break;
+      inputHoldingCids.push(h.contractId);
+      remaining -= parseFloat(h.payload?.amount || '0');
+    }
+
+    // Step 2: Call the utility backend transfer-factory endpoint
+    const now = new Date();
+    const threeDaysLater = new Date(now.getTime() + 3 * 24 * 60 * 60 * 1000);
+    const fmt = (d: Date) => d.toISOString().replace(/\.\d+Z$/, 'Z');
+
+    const factoryToken = userToken || await this.getLedgerApiToken();
+    const factoryUrl = `${this.usdcxUtilityBackendUrl}/api/token-standard/v0/registrars/${encodeURIComponent(this.usdcxAdminPartyId)}/registry/transfer-instruction/v1/transfer-factory`;
+    const factoryResponse = await this.customFetch(factoryUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${factoryToken}` },
+      body: JSON.stringify({
+        choiceArguments: {
+          expectedAdmin: this.usdcxAdminPartyId,
+          transfer: {
+            sender: senderPartyId,
+            receiver: recipientPartyId,
+            amount: amount.toString(),
+            instrumentId: { admin: this.usdcxAdminPartyId, id: 'USDCx' },
+            requestedAt: fmt(now),
+            executeBefore: fmt(threeDaysLater),
+            inputHoldingCids,
+            meta: { values: { 'splice.lfdecentralizedtrust.org/reason': '' } },
+          },
+          extraArgs: { context: { values: {} }, meta: { values: {} } },
+        },
+        excludeDebugFields: true,
+      }),
+    });
+
+    if (!factoryResponse.ok) {
+      const err = await factoryResponse.text();
+      throw new Error(`USDCx transfer-factory error (${factoryResponse.status}): ${err}`);
+    }
+    const factoryData = await factoryResponse.json();
+    const factoryId = factoryData.factoryId;
+    const choiceContextData = factoryData.choiceContext?.choiceContextData;
+    const disclosedContracts = factoryData.choiceContext?.disclosedContracts || [];
+
+    // Step 3: Submit DAML command with operator token
+    const transferFactoryInterface = '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferFactory';
+    const commandId = `rhein-usdcx-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const token = await this.getLedgerApiToken();
+
+    // Normalize disclosed contracts to only fields the participant accepts
+    const normalizedDisclosedContracts = disclosedContracts.map((dc: any) => ({
+      contractId: dc.contractId,
+      templateId: dc.templateId,
+      createdEventBlob: dc.createdEventBlob,
+      domainId: '',
+      synchronizerId: '',
+    }));
+
+    const commandBody = {
+      commands: {
+        userId: this.damlUserId,
+        commandId,
+        workflowId: '',
+        commands: [{
+          ExerciseCommand: {
+            templateId: transferFactoryInterface,
+            contractId: factoryId,
+            choice: 'TransferFactory_Transfer',
+            choiceArgument: {
+              expectedAdmin: this.usdcxAdminPartyId,
+              transfer: {
+                sender: senderPartyId,
+                receiver: recipientPartyId,
+                amount: amount.toString(),
+                instrumentId: { admin: this.usdcxAdminPartyId, id: 'USDCx' },
+                requestedAt: fmt(now),
+                executeBefore: fmt(threeDaysLater),
+                inputHoldingCids,
+                meta: { values: { 'splice.lfdecentralizedtrust.org/reason': '' } },
+              },
+              extraArgs: { context: choiceContextData, meta: { values: {} } },
+            },
+          },
+        }],
+        actAs: [senderPartyId],
+        readAs: [],
+        disclosedContracts: normalizedDisclosedContracts,
+        domainId: '',
+        packageIdSelectionPreference: [],
+      },
+    };
+
+    console.log(`[USDCx] Submitting TransferFactory_Transfer command`);
+    const cmdResponse = await this.customFetch(
+      `${this.jsonApiUrl}/v2/commands/submit-and-wait-for-transaction`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify(commandBody),
+      },
+    );
+
+    if (!cmdResponse.ok) {
+      const err = await cmdResponse.text();
+      console.error(`[USDCx] Transfer command error: ${err}`);
+      throw new Error(`USDCx transfer failed (${cmdResponse.status}): ${err}`);
+    }
+
+    const cmdResult = await cmdResponse.json();
+    console.log(`[USDCx] Transfer instruction created`);
+
+    return {
+      success: true,
+      amount,
+      from: senderPartyId,
+      to: recipientPartyId,
+      expiresAt: threeDaysLater.toISOString(),
+      updateId: cmdResult.transaction?.updateId,
+    };
   }
 }

@@ -5,6 +5,7 @@ import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { User } from '../users/entities/user.entity';
 import { TransferUsdcDto } from './dto/transfer-usdc.dto';
 import { TransferCcDto } from './dto/transfer-cc.dto';
+import { TransferUsdcDto as TransferUsdcxDto } from './dto/transfer-usdc.dto';
 
 @ApiTags('wallet')
 @ApiBearerAuth()
@@ -83,5 +84,40 @@ export class WalletController {
   ) {
     const result = await this.walletService.rejectTransfer(user.partyId, transferId, user.rawToken);
     return { success: true, data: result };
+  }
+
+  // ========== USDCx ENDPOINTS ==========
+
+  @Get('usdcx/balance')
+  @ApiOperation({ summary: 'Get USDCx balance (Canton Universal Bridge token)' })
+  @ApiResponse({ status: 200, description: 'Returns available and total USDCx balance' })
+  async getUSDCxBalance(@CurrentUser() user: User) {
+    const balance = await this.walletService.getUSDCxBalance(user.partyId);
+    return { success: true, data: balance };
+  }
+
+  @Post('usdcx/transfer')
+  @ApiOperation({ summary: 'Transfer USDCx to another party (creates transfer instruction, recipient must accept)' })
+  @ApiResponse({ status: 200, description: 'USDCx transfer instruction created' })
+  @ApiResponse({ status: 400, description: 'Insufficient balance or invalid recipient' })
+  async transferUSDCx(
+    @CurrentUser() user: User,
+    @Body() dto: TransferUsdcxDto,
+  ) {
+    const result = await this.walletService.transferUSDCx(
+      user.partyId,
+      dto.recipientPartyId,
+      dto.amount,
+      user.rawToken,
+    );
+    return { success: true, data: result };
+  }
+
+  @Get('usdcx/context')
+  @ApiOperation({ summary: 'Get USDCx Burn Mint Factory context (for deposit/withdrawal operations)' })
+  @ApiResponse({ status: 200, description: 'Returns factoryCid, contextContractIds, and disclosedContracts' })
+  async getUSDCxContext(@CurrentUser() user: User) {
+    const context = await this.walletService.getUSDCxBurnMintContext(user.partyId);
+    return { success: true, data: context };
   }
 }

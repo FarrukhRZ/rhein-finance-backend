@@ -61,4 +61,22 @@ export class WalletService {
     this.ensureOnboarded(partyId);
     return this.damlService.rejectTransfer(transferId, userToken);
   }
+
+  async getUSDCxBalance(partyId: string | null) {
+    const party = this.ensureOnboarded(partyId);
+    return this.damlService.getUSDCxBalance(party);
+  }
+
+  async transferUSDCx(partyId: string | null, recipientPartyId: string, amount: number, userToken?: string) {
+    const party = this.ensureOnboarded(partyId);
+    if (party === recipientPartyId) {
+      throw new BadRequestException('Cannot transfer to yourself');
+    }
+    return this.damlService.transferUSDCx(party, recipientPartyId, amount, userToken);
+  }
+
+  async getUSDCxBurnMintContext(partyId: string | null) {
+    const party = this.ensureOnboarded(partyId);
+    return this.damlService.getUSDCxBurnMintContext(party);
+  }
 }
