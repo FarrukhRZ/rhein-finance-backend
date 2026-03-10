@@ -1328,16 +1328,29 @@ export class DamlService {
    */
   async rejectTransfer(transferId: string, userToken?: string): Promise<any> {
     console.log(`[Transfer] Rejecting CC transfer: ${transferId}`);
+
+    // 1. Receiver rejects a token-standard transfer instruction
     try {
       const result = await this.walletApiFetch(`token-standard/transfers/${transferId}/reject`, 'POST', {}, userToken);
-      console.log(`[Transfer] CC transfer rejected (token-standard)`);
+      console.log(`[Transfer] CC transfer rejected (token-standard receiver reject)`);
       return result;
     } catch (err) {
-      console.log(`[Transfer] token-standard reject failed, trying transfer-offers withdraw...`);
-      const result = await this.walletApiFetch(`transfer-offers/${transferId}/withdraw`, 'POST', {}, userToken);
-      console.log(`[Transfer] CC transfer rejected (transfer-offer)`);
-      return result;
+      console.log(`[Transfer] token-standard reject failed (${(err as Error).message}), trying abort...`);
     }
+
+    // 2. Sender withdraws a token-standard AmuletTransferInstruction
+    try {
+      const result = await this.walletApiFetch(`token-standard/transfers/${transferId}/withdraw`, 'POST', {}, userToken);
+      console.log(`[Transfer] CC transfer withdrawn (token-standard sender withdraw)`);
+      return result;
+    } catch (err) {
+      console.log(`[Transfer] token-standard withdraw failed (${(err as Error).message}), trying legacy withdraw...`);
+    }
+
+    // 3. Legacy TransferOffer withdraw
+    const result = await this.walletApiFetch(`transfer-offers/${transferId}/withdraw`, 'POST', {}, userToken);
+    console.log(`[Transfer] CC transfer withdrawn (legacy transfer-offer)`);
+    return result;
   }
 
   /**
