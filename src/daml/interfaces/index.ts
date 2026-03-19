@@ -28,32 +28,8 @@ export interface LockedAmulet {
 }
 
 // ============================================================================
-// Custom Token Interfaces (USDC)
+// Loan Contract Interfaces
 // ============================================================================
-
-export interface AssetHolding {
-  contractId: string;
-  payload: {
-    issuer: string;
-    owner: string;
-    custodian: string;
-    assetType: string;
-    amount: string;
-  };
-}
-
-export interface LockedAssetHolding {
-  contractId: string;
-  payload: {
-    issuer: string;
-    owner: string;
-    custodian: string;
-    assetType: string;
-    amount: string;
-    lockReason: string;
-    releaseTo: string;
-  };
-}
 
 export interface LoanOfferHybrid {
   contractId: string;
@@ -62,14 +38,12 @@ export interface LoanOfferHybrid {
     counterparty: string | null;
     offerType: 'BorrowerBid' | 'LenderAsk';
     lockedCCCollateral: string | null;
-    lockedUSDCPrincipal: string | null;
     loanAmount: string;
     collateralAmount: string;
     interestRate: string;
     maturityDate: string;
     ltvRatio: string;
     ccPrice: string;
-    stablecoinType: string;
     createdAt: string;
     observers: string[];
   };
@@ -87,7 +61,6 @@ export interface ActiveLoanHybrid {
     maturityDate: string;
     originationDate: string;
     ccPrice: string;
-    stablecoinType: string;
   };
 }
 
@@ -96,6 +69,7 @@ export interface TokenBalance {
   available: number;
   locked: number;
   borrowed: number;
+  lent?: number;
   total: number;
 }
 

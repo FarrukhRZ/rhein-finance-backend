@@ -17,14 +17,6 @@ export class WalletService {
     return this.damlService.getTokenBalances(party);
   }
 
-  async transferUSDC(partyId: string | null, recipientPartyId: string, amount: number) {
-    const party = this.ensureOnboarded(partyId);
-    if (party === recipientPartyId) {
-      throw new BadRequestException('Cannot transfer to yourself');
-    }
-    return this.damlService.transferUSDC(party, recipientPartyId, amount);
-  }
-
   async transferCC(partyId: string | null, recipientPartyId: string, amount: number, userToken?: string) {
     const party = this.ensureOnboarded(partyId);
     if (party === recipientPartyId) {
@@ -78,5 +70,16 @@ export class WalletService {
   async getUSDCxBurnMintContext(partyId: string | null) {
     const party = this.ensureOnboarded(partyId);
     return this.damlService.getUSDCxBurnMintContext(party);
+  }
+
+  async getIncomingUSDCxTransfers(partyId: string | null) {
+    const party = this.ensureOnboarded(partyId);
+    return this.damlService.getIncomingUSDCxTransfers(party);
+  }
+
+  async acceptUSDCxTransfer(partyId: string | null, contractId: string, userToken?: string) {
+    const party = this.ensureOnboarded(partyId);
+    await this.damlService.acceptUSDCxTransfer(contractId, party, userToken);
+    return { accepted: true, contractId };
   }
 }

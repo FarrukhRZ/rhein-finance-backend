@@ -8,7 +8,6 @@ import { CreateOfferDto } from './dto/create-offer.dto';
 import { AcceptOfferDto } from './dto/accept-offer.dto';
 import { RepayLoanDto } from './dto/repay-loan.dto';
 import { DefaultLoanDto } from './dto/default-loan.dto';
-import { IssueTokensDto } from './dto/issue-tokens.dto';
 
 @ApiTags('loans', 'offers', 'balances')
 @ApiBearerAuth()
@@ -117,18 +116,4 @@ export class LoansController {
     return { success: true, data: balances };
   }
 
-  // ========== FAUCET ENDPOINTS ==========
-
-  @Public()
-  @Post('faucet/issue')
-  @ApiOperation({ summary: 'Issue USDC test tokens to a party (CC comes from real Canton Coins)' })
-  @ApiResponse({ status: 200, description: 'USDC issued successfully' })
-  @ApiResponse({ status: 400, description: 'Invalid party ID' })
-  async issueTokens(@Body() dto: IssueTokensDto) {
-    const result = await this.loansService.issueTokens(dto.partyId);
-    return {
-      success: result.success,
-      message: result.message
-    };
-  }
 }

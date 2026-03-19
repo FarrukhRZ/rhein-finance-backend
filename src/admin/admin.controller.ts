@@ -36,7 +36,7 @@ export class AdminController {
     @Param('userId') userId: string,
     @Body() dto: OnboardUserDto,
   ) {
-    return this.adminService.onboardUser(userId, dto.initialUsdcAmount);
+    return this.adminService.onboardUser(userId);
   }
 
   @Post('deposits/approve')

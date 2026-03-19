@@ -108,9 +108,10 @@ export class AdminService {
   }
 
   /**
-   * Onboard a registered user: allocate Canton party, link to user, issue initial USDC.
+   * Onboard a registered user: allocate Canton party and link to user.
+   * USDCx is a real token obtained via the Canton Universal Bridge — no minting here.
    */
-  async onboardUser(userId: string, initialUsdcAmount?: number) {
+  async onboardUser(userId: string) {
     const user = await this.usersService.findById(userId);
     if (!user) {
       throw new NotFoundException(`User ${userId} not found`);
@@ -120,7 +121,6 @@ export class AdminService {
     }
 
     const displayName = user.firstName || user.email.split('@')[0];
-    // Use lowercase alphanumeric username + random suffix for uniqueness
     const baseName = displayName.toLowerCase().replace(/[^a-z0-9]/g, '');
     const suffix = Math.random().toString(36).slice(2, 6);
     const damlUsername = `${baseName}-${suffix}`;
@@ -132,7 +132,7 @@ export class AdminService {
     // 2. Link party to user record
     await this.usersService.update(userId, { partyId });
 
-    // 3. Save party record in DB and link to user
+    // 3. Save party record in DB
     const party = this.partyRepository.create({
       partyId,
       displayName: damlUsername,
@@ -142,11 +142,7 @@ export class AdminService {
     });
     await this.partyRepository.save(party);
 
-    // 4. Issue initial USDC
-    const usdcAmount = initialUsdcAmount || 100000;
-    const issueResult = await this.damlService.issueTokensToParty(partyId, usdcAmount);
-
-    console.log(`[Onboard] User ${user.email} onboarded: party=${partyId}, USDC=${usdcAmount}`);
+    console.log(`[Onboard] User ${user.email} onboarded: party=${partyId}`);
 
     return {
       success: true,
@@ -159,11 +155,6 @@ export class AdminService {
       party: {
         partyId,
         displayName,
-      },
-      wallet: {
-        usdcIssued: usdcAmount,
-        issueSuccess: issueResult.success,
-        message: issueResult.message,
       },
     };
   }
@@ -216,23 +207,14 @@ export class AdminService {
       approvedAt: new Date(),
     });
 
-    // Issue tokens
-    const result = await this.damlService.issueTokensToParty(data.partyId, data.amount);
-    console.log('Token issuance result:', result);
-    // Update deposit status based on result
-    if (result.success) {
-      deposit.status = 'completed';
-      deposit.completedAt = new Date();
-    } else {
-      deposit.status = 'failed';
-      deposit.errorMessage = result.message;
-    }
-
+    // USDCx is a real token via Canton Universal Bridge — record the deposit for reference only
+    deposit.status = 'completed';
+    deposit.completedAt = new Date();
     await this.depositRepository.save(deposit);
 
     return {
-      success: result.success,
-      message: result.message || `Successfully issued ${data.amount} ${data.assetType} to ${partyName}`,
+      success: true,
+      message: `Deposit of ${data.amount} ${data.assetType} recorded for ${partyName}. USDCx is obtained via the Canton Universal Bridge.`,
       deposit: {
         id: deposit.id,
         partyId: data.partyId,

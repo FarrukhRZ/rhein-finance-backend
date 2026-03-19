@@ -3,8 +3,6 @@ import { ConfigService } from '@nestjs/config';
 import * as http from 'http';
 import * as https from 'https';
 import {
-  AssetHolding,
-  LockedAssetHolding,
   LoanOffer,
   ActiveLoan,
   TokenBalance,
@@ -359,6 +357,80 @@ export class DamlService {
   }
 
   /**
+   * List pending incoming USDCx TransferOffer contracts for a party (they are the receiver).
+   * These are created by TransferFactory_Transfer and require the receiver to accept.
+   */
+  async getIncomingUSDCxTransfers(partyId: string): Promise<any[]> {
+    const offset = await this.getLatestOffset();
+    const token = await this.getLedgerApiToken();
+
+    // Query using the TransferInstruction interface — the official way per DA utilities docs
+    const TRANSFER_INSTRUCTION_INTERFACE = '55ba4deb0ad4662c4168b39859738a0e91388d252286480c7331b3f71a517281:Splice.Api.Token.TransferInstructionV1:TransferInstruction';
+
+    const body = {
+      userId: this.damlUserId,
+      filter: {
+        filtersByParty: {
+          [partyId]: {
+            cumulative: [{
+              identifierFilter: {
+                InterfaceFilter: {
+                  value: {
+                    interfaceId: TRANSFER_INSTRUCTION_INTERFACE,
+                    includeInterfaceView: true,
+                    includeCreatedEventBlob: false,
+                  },
+                },
+              },
+            }],
+          },
+        },
+      },
+      activeAtOffset: offset,
+    };
+
+    const response = await this.customFetch(`${this.jsonApiUrl}/v2/state/active-contracts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`ACS query failed (${response.status}): ${errText}`);
+    }
+
+    const data = await response.json();
+    const transfers: any[] = [];
+
+    for (const entry of data) {
+      const event = entry.contractEntry?.JsActiveContract?.createdEvent || entry.createdEvent;
+      if (!event?.contractId) continue;
+
+      // Data comes from the interface view, not createArgument
+      const view = event.interfaceViews?.[0]?.viewValue;
+      if (!view) continue;
+
+      const transfer = view.transfer;
+      // Only include USDCx transfers where receiver = current user
+      if (transfer?.receiver !== partyId) continue;
+      if (transfer?.instrumentId?.id !== 'USDCx') continue;
+
+      transfers.push({
+        contractId: event.contractId,
+        sender: transfer.sender,
+        receiver: transfer.receiver,
+        amount: transfer.amount,
+        executeBefore: transfer.executeBefore,
+        status: view.status?.tag || 'TransferPendingReceiverAcceptance',
+      });
+    }
+
+    console.log(`[USDCx] Found ${transfers.length} pending incoming transfers for ${partyId}`);
+    return transfers;
+  }
+
+  /**
    * Submit a command and wait for the transaction result.
    * Uses v2 API with userId auth (no JWT needed).
    *
@@ -440,24 +512,6 @@ export class DamlService {
   }
 
   // ============================================================================
-  // TOKEN BALANCE QUERIES
-  // ============================================================================
-
-  async queryAssetHoldings(partyId: string): Promise<AssetHolding[]> {
-    return this.queryContracts(
-      [this.templateId('Holding:AssetHolding')],
-      [partyId],
-    );
-  }
-
-  async queryLockedAssetHoldings(partyId: string): Promise<LockedAssetHolding[]> {
-    return this.queryContracts(
-      [this.templateId('Holding:LockedAssetHolding')],
-      [partyId],
-    );
-  }
-
-  // ============================================================================
   // CANTON COIN (AMULET) QUERIES
   // ============================================================================
 
@@ -483,28 +537,24 @@ export class DamlService {
     );
   }
 
-  async getTokenBalances(partyId: string): Promise<{ usdc: TokenBalance; cc: TokenBalance }> {
-    // USDC: from custom AssetHolding contracts
-    const holdings = await this.queryAssetHoldings(partyId);
-    const lockedHoldings = await this.queryLockedAssetHoldings(partyId);
-    const activeLoans = await this.queryActiveLoans(partyId);
+  async getTokenBalances(partyId: string): Promise<{ usdcx: TokenBalance; cc: TokenBalance }> {
+    // USDCx: from DA Utilities holdings
+    const [usdcxBalance, amulets, lockedAmulets, activeLoans] = await Promise.all([
+      this.getUSDCxBalance(partyId),
+      this.queryAmulets(partyId),
+      this.queryLockedAmulets(partyId),
+      this.queryActiveLoans(partyId),
+    ]);
 
-    const usdcAvailable = holdings
-      .filter(h => h.payload.assetType === 'USDC' && h.payload.owner === partyId)
-      .reduce((sum, h) => sum + parseFloat(h.payload.amount), 0);
-
-    const usdcLocked = lockedHoldings
-      .filter(h => h.payload.assetType === 'USDC' && h.payload.owner === partyId)
-      .reduce((sum, h) => sum + parseFloat(h.payload.amount), 0);
-
-    const usdcBorrowed = activeLoans
+    const usdcxBorrowed = activeLoans
       .filter((loan: ActiveLoan) => loan.payload.borrower === partyId)
       .reduce((sum, loan: ActiveLoan) => sum + parseFloat(loan.payload.principal), 0);
 
-    // CC: from real Canton Network Amulet contracts
-    const amulets = await this.queryAmulets(partyId);
-    const lockedAmulets = await this.queryLockedAmulets(partyId);
+    const usdcxLent = activeLoans
+      .filter((loan: ActiveLoan) => loan.payload.lender === partyId)
+      .reduce((sum, loan: ActiveLoan) => sum + parseFloat(loan.payload.principal), 0);
 
+    // CC: from real Canton Network Amulet contracts
     const ccAvailable = amulets.reduce(
       (sum, a) => sum + this.calculateAmuletAmount(a.payload.amount), 0,
     );
@@ -514,12 +564,13 @@ export class DamlService {
     );
 
     return {
-      usdc: {
-        assetType: 'USDC',
-        available: usdcAvailable,
-        locked: usdcLocked,
-        borrowed: usdcBorrowed,
-        total: usdcAvailable + usdcLocked,
+      usdcx: {
+        assetType: 'USDCx',
+        available: usdcxBalance.available,
+        locked: usdcxBalance.locked,
+        borrowed: usdcxBorrowed,
+        lent: usdcxLent,
+        total: usdcxBalance.available + usdcxLent,
       },
       cc: {
         assetType: 'CC',
@@ -529,105 +580,6 @@ export class DamlService {
         total: ccAvailable + ccLocked,
       },
     };
-  }
-
-  // ============================================================================
-  // TOKEN OPERATIONS (USDC - Custom AssetHolding)
-  // ============================================================================
-
-  async lockUSDC(
-    partyId: string,
-    amount: number,
-    lockReason: string,
-    releaseTo: string,
-  ): Promise<string> {
-    const holdings = await this.queryAssetHoldings(partyId);
-    const usdcHoldings = holdings.filter(
-      h => h.payload.assetType === 'USDC' && h.payload.owner === partyId,
-    );
-
-    if (usdcHoldings.length === 0) {
-      throw new Error(`No USDC holdings found for party ${partyId}`);
-    }
-
-    let holdingToLock: AssetHolding | null = null;
-
-    const exactMatch = usdcHoldings.find(h => parseFloat(h.payload.amount) === amount);
-    if (exactMatch) {
-      holdingToLock = exactMatch;
-    } else {
-      const largeEnough = usdcHoldings.find(h => parseFloat(h.payload.amount) >= amount);
-      if (!largeEnough) {
-        const totalAvailable = usdcHoldings.reduce((sum, h) => sum + parseFloat(h.payload.amount), 0);
-        throw new Error(`Insufficient USDC balance. Need ${amount}, have ${totalAvailable}`);
-      }
-
-      console.log(`Splitting USDC holding ${largeEnough.contractId} - need ${amount}, have ${largeEnough.payload.amount}`);
-      const splitResult = await this.submitCommand(
-        [this.exerciseCmd(
-          this.templateId('Holding:AssetHolding'),
-          largeEnough.contractId,
-          'Split',
-          { splitAmount: amount.toString() },
-        )],
-        [partyId],
-      );
-
-      const exerciseResult = this.getExerciseResult(splitResult);
-      // Split returns a tuple (ContractId, ContractId) - try various formats
-      const splitAmountCid = exerciseResult?._1
-        || (Array.isArray(exerciseResult) ? exerciseResult[0] : undefined)
-        || (typeof exerciseResult === 'string' ? exerciseResult : undefined);
-
-      if (splitAmountCid) {
-        holdingToLock = {
-          contractId: splitAmountCid,
-          payload: { ...largeEnough.payload, amount: amount.toString() },
-        };
-      } else {
-        // Fallback: get the first created contract from events
-        const events = splitResult.transaction?.events || [];
-        const createdEvents = events
-          .map((e: any) => e.CreatedEvent || e.created)
-          .filter((e: any) => e?.contractId);
-
-        if (createdEvents.length > 0) {
-          // First created event is the split amount, second is the remainder
-          console.log(`Split created ${createdEvents.length} contracts, using first as split amount`);
-          holdingToLock = {
-            contractId: createdEvents[0].contractId,
-            payload: { ...largeEnough.payload, amount: amount.toString() },
-          };
-        } else {
-          console.error('Split result structure:', JSON.stringify(splitResult, null, 2).substring(0, 2000));
-          throw new Error('Split did not return expected contract IDs');
-        }
-      }
-    }
-
-    console.log(`Locking USDC holding ${holdingToLock.contractId} for ${amount}`);
-    const lockResult = await this.submitCommand(
-      [this.exerciseCmd(
-        this.templateId('Holding:AssetHolding'),
-        holdingToLock.contractId,
-        'Lock',
-        { lockReason, releaseTo },
-      )],
-      [partyId],
-    );
-
-    let lockedCid = this.getExerciseResult(lockResult);
-    if (!lockedCid || typeof lockedCid !== 'string') {
-      // Fallback: find the created LockedAssetHolding contract
-      lockedCid = this.getCreatedContractId(lockResult);
-    }
-    if (!lockedCid) {
-      console.error('Lock result structure:', JSON.stringify(lockResult, null, 2).substring(0, 2000));
-      throw new Error('Lock did not return expected contract ID');
-    }
-
-    console.log(`Successfully locked ${amount} USDC -> ${lockedCid}`);
-    return lockedCid;
   }
 
   // ============================================================================
@@ -681,80 +633,42 @@ export class DamlService {
 
     const offerContractId = result.offer_contract_id;
     console.log(`[Amulet Lock] Created TransferOffer ${offerContractId} (tracking: ${trackingId})`);
+
+    // Immediately accept the TransferOffer using admin M2M token so CC moves into admin escrow.
+    // This prevents the borrower from withdrawing the collateral after the loan is created.
+    console.log(`[Amulet Lock] Auto-accepting collateral into admin escrow...`);
+    await this.walletApiFetch(`transfer-offers/${offerContractId}/accept`, 'POST', {});
+    console.log(`[Amulet Lock] CC collateral is now held in admin escrow`);
+
     return offerContractId;
   }
 
   /**
-   * Unlock CC collateral by withdrawing the TransferOffer (e.g., after loan repayment).
-   * This returns the CC back to the original sender.
+   * Return CC collateral from admin escrow to a recipient (borrower on repay, lender on default).
+   * Creates a new TransferOffer from admin → recipient and auto-accepts using their token.
    */
-  async unlockAmulet(transferOfferCid: string, _partyId: string, userToken?: string): Promise<string> {
-    console.log(`[Amulet Unlock] Withdrawing TransferOffer ${transferOfferCid}`);
+  async returnCCCollateral(recipientPartyId: string, amount: number, recipientUserToken?: string): Promise<void> {
+    console.log(`[Amulet Return] Sending ${amount} CC from admin escrow to ${recipientPartyId}`);
 
-    await this.walletApiFetch(`transfer-offers/${transferOfferCid}/withdraw`, 'POST', {}, userToken);
+    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h window to accept
+    const expiresAtMicros = expiresAt.getTime() * 1000;
+    const trackingId = `collateral-return-${Date.now()}`;
 
-    console.log(`[Amulet Unlock] Successfully withdrew TransferOffer - CC returned to sender`);
-    return transferOfferCid;
-  }
+    // Create TransferOffer from admin (no userToken = uses admin M2M wallet)
+    const result = await this.walletApiFetch('transfer-offers', 'POST', {
+      receiver_party_id: recipientPartyId,
+      amount: amount.toString(),
+      description: `Collateral return: ${amount} CC`,
+      expires_at: expiresAtMicros,
+      tracking_id: trackingId,
+    });
 
-  // ============================================================================
-  // FAUCET OPERATIONS (Token Initialization)
-  // ============================================================================
+    const offerContractId = result.offer_contract_id;
+    console.log(`[Amulet Return] TransferOffer ${offerContractId} created, auto-accepting for recipient`);
 
-  async initializeAssetIssuers(): Promise<string> {
-    try {
-      const issuers = await this.queryContracts(
-        [this.templateId('Holding:AssetIssuer')],
-        [this.adminPartyId],
-      );
-
-      if (issuers.length > 0) {
-        console.log('Found existing issuer:', issuers[0].contractId);
-        return issuers[0].contractId;
-      }
-    } catch (err) {
-      console.log('Issuer not found, creating new one...');
-    }
-
-    const result = await this.submitCommand(
-      [this.createCmd(this.templateId('Holding:AssetIssuer'), {
-        issuer: this.adminPartyId,
-        custodian: this.adminPartyId,
-      })],
-      [this.adminPartyId],
-    );
-
-    const contractId = this.getCreatedContractId(result);
-    console.log('Created new issuer:', contractId);
-    return contractId;
-  }
-
-  async issueTokensToParty(
-    partyId: string,
-    amount?: number,
-  ): Promise<{ success: boolean; message: string }> {
-    try {
-      const issuerContractId = await this.initializeAssetIssuers();
-      const usdcAmount = amount || 100000;
-
-      await this.submitCommand(
-        [this.exerciseCmd(
-          this.templateId('Holding:AssetIssuer'),
-          issuerContractId,
-          'IssueAsset',
-          { owner: partyId, assetType: 'USDC', amount: usdcAmount.toString() },
-        )],
-        [this.adminPartyId, partyId],
-      );
-
-      return { success: true, message: `Successfully issued ${usdcAmount} USDC (CC comes from real Canton Coins)` };
-    } catch (err) {
-      console.error('Error issuing USDC:', err);
-      return {
-        success: false,
-        message: err instanceof Error ? err.message : 'Failed to issue USDC',
-      };
-    }
+    // Auto-accept on behalf of the recipient
+    await this.walletApiFetch(`transfer-offers/${offerContractId}/accept`, 'POST', {}, recipientUserToken);
+    console.log(`[Amulet Return] CC collateral successfully returned to ${recipientPartyId}`);
   }
 
   // ============================================================================
@@ -789,89 +703,108 @@ export class DamlService {
     const today = new Date().toISOString().split('T')[0];
 
     let lockedCCCollateral: string | null = null;
-    let lockedUSDCPrincipal: string | null = null;
 
     if (offer.offerType === 'BorrowerBid') {
-      // Borrower locks real CC (Amulet) as collateral
+      // Borrower locks real CC (Amulet) as collateral via TransferOffer
       const expiresAt = new Date(offer.maturityDate + 'T23:59:59Z').toISOString();
-      const lockedCid = await this.lockAmulet(
+      lockedCCCollateral = await this.lockAmulet(
         partyId,
         parseFloat(offer.collateralAmount),
         this.adminPartyId,
         expiresAt,
         userToken,
       );
-      lockedCCCollateral = lockedCid;
-    } else {
-      // Lender locks USDC principal
-      // releaseTo = initiator (self-lock) so that AcceptHybrid and CancelOfferHybrid
-      // can exercise Unlock without needing the admin in the authorization context
-      const lockedCid = await this.lockUSDC(
-        partyId,
-        parseFloat(offer.loanAmount),
-        `LenderAsk for ${offer.loanAmount} USDC loan`,
-        partyId,
-      );
-      lockedUSDCPrincipal = lockedCid;
     }
+    // LenderAsk: no upfront locking needed — lender disburses USDCx off-chain after acceptance
 
     return this.submitCommand(
       [this.createCmd(this.templateId('LoanOfferHybrid:LoanOfferHybrid'), {
+        provider: this.adminPartyId,
         initiator: partyId,
         counterparty: null,
         offerType: offer.offerType,
         lockedCCCollateral,
-        lockedUSDCPrincipal,
         loanAmount: offer.loanAmount,
         collateralAmount: offer.collateralAmount,
         interestRate: offer.interestRate,
         maturityDate: offer.maturityDate,
         ltvRatio: this.defaultLtv.toString(),
         ccPrice: this.ccPrice.toString(),
-        stablecoinType: 'USDC',
         createdAt: today,
         observers: [this.adminPartyId],
       })],
-      [partyId],
+      [this.adminPartyId, partyId],
     );
   }
 
   async acceptLoanOffer(partyId: string, offerContractId: string, offer: LoanOffer, userToken?: string): Promise<any> {
-    let acceptorUSDCCid: string | null = null;
     let acceptorCCReference: string | null = null;
 
-    if (offer.payload.offerType === 'BorrowerBid') {
-      // Acceptor (lender) provides USDC
-      const lockedCid = await this.lockUSDC(
-        partyId,
-        parseFloat(offer.payload.loanAmount),
-        `Accepting offer ${offerContractId}`,
-        offer.payload.initiator,
-      );
-      acceptorUSDCCid = lockedCid;
-    } else {
-      // Acceptor (borrower) provides real CC (Amulet)
+    if (offer.payload.offerType === 'LenderAsk') {
+      // Acceptor (borrower) provides CC collateral
       const expiresAt = new Date(offer.payload.maturityDate + 'T23:59:59Z').toISOString();
-      const lockedCid = await this.lockAmulet(
+      acceptorCCReference = await this.lockAmulet(
         partyId,
         parseFloat(offer.payload.collateralAmount),
         this.adminPartyId,
         expiresAt,
         userToken,
       );
-      acceptorCCReference = lockedCid;
     }
+    // BorrowerBid: lender (acceptor) provides no upfront lock — disburses USDCx off-chain below
 
     console.log(`Accepting offer ${offerContractId} as ${partyId} (initiator: ${offer.payload.initiator})`);
-    return this.submitCommand(
+    const result = await this.submitCommand(
       [this.exerciseCmd(
         this.templateId('LoanOfferHybrid:LoanOfferHybrid'),
         offerContractId,
         'AcceptHybrid',
-        { acceptor: partyId, acceptorUSDCCid, acceptorCCReference },
+        { acceptor: partyId, acceptorCCReference },
       )],
-      [offer.payload.initiator, partyId, this.adminPartyId],
+      [this.adminPartyId, offer.payload.initiator, partyId],
     );
+
+    // Disburse USDCx from lender to borrower immediately after loan creation
+    let disbursementResult: any = null;
+    let disbursementError: string | null = null;
+    try {
+      const loanAmount = parseFloat(offer.payload.loanAmount);
+      let lenderPartyId: string;
+      let borrowerPartyId: string;
+      let senderToken: string | undefined;
+
+      if (offer.payload.offerType === 'BorrowerBid') {
+        // partyId = lender (acceptor), initiator = borrower
+        lenderPartyId = partyId;
+        borrowerPartyId = offer.payload.initiator;
+        senderToken = userToken; // lender's own token
+      } else {
+        // LenderAsk: initiator = lender, partyId = borrower (acceptor)
+        lenderPartyId = offer.payload.initiator;
+        borrowerPartyId = partyId;
+        senderToken = undefined; // use admin ledger token to act as lender
+      }
+
+      console.log(`[USDCx] Disbursing ${loanAmount} USDCx from lender ${lenderPartyId} to borrower ${borrowerPartyId}`);
+      disbursementResult = await this.transferUSDCx(lenderPartyId, borrowerPartyId, loanAmount, senderToken);
+      console.log(`[USDCx] Disbursement transfer instruction created successfully`);
+
+      // Auto-accept the TransferOffer on behalf of the borrower
+      if (disbursementResult?.transferOfferContractId) {
+        try {
+          await this.acceptUSDCxTransfer(disbursementResult.transferOfferContractId, borrowerPartyId);
+        } catch (acceptErr: any) {
+          console.error(`[USDCx] Auto-accept failed (borrower must accept manually): ${acceptErr?.message}`);
+        }
+      } else {
+        console.warn(`[USDCx] No TransferOffer contract ID found in disbursement result — borrower must accept manually`);
+      }
+    } catch (err: any) {
+      disbursementError = err?.message || String(err);
+      console.error(`[USDCx] Failed to disburse USDCx after accepting offer: ${disbursementError}`);
+    }
+
+    return { ...result, disbursement: disbursementResult, disbursementError };
   }
 
   // ============================================================================
@@ -896,78 +829,43 @@ export class DamlService {
     }
 
     const lender = loan.payload.lender;
-    console.log(`Repaying loan ${loanContractId} - Borrower: ${partyId}, Lender: ${lender}`);
+    console.log(`Repaying loan ${loanContractId} - Borrower: ${partyId}, Lender: ${lender}, Amount: ${repaymentAmount} USDCx`);
 
-    // Find or split a USDC holding for repayment
-    const holdings = await this.queryAssetHoldings(partyId);
-    const usdcHoldings = holdings.filter(
-      h => h.payload.assetType === 'USDC' && h.payload.owner === partyId,
-    );
+    // Step 1: Transfer USDCx from borrower back to lender
+    console.log(`[USDCx] Transferring ${repaymentAmount} USDCx from borrower ${partyId} to lender ${lender}`);
+    const transferResult = await this.transferUSDCx(partyId, lender, repaymentAmount, userToken);
+    console.log(`[USDCx] Repayment transfer created, auto-accepting on behalf of lender`);
 
-    if (usdcHoldings.length === 0) {
-      throw new Error('No USDC holdings found for repayment');
-    }
-
-    let repaymentHoldingCid: string;
-    const exactMatch = usdcHoldings.find(h => Math.abs(parseFloat(h.payload.amount) - repaymentAmount) < 0.01);
-
-    if (exactMatch) {
-      repaymentHoldingCid = exactMatch.contractId;
-    } else {
-      const largeEnough = usdcHoldings.find(h => parseFloat(h.payload.amount) >= repaymentAmount);
-      if (!largeEnough) {
-        const totalAvailable = usdcHoldings.reduce((sum, h) => sum + parseFloat(h.payload.amount), 0);
-        throw new Error(`Insufficient USDC for repayment. Need ${repaymentAmount}, have ${totalAvailable}`);
-      }
-
-      const splitResult = await this.submitCommand(
-        [this.exerciseCmd(
-          this.templateId('Holding:AssetHolding'),
-          largeEnough.contractId,
-          'Split',
-          { splitAmount: repaymentAmount.toString() },
-        )],
-        [partyId],
-      );
-
-      const exerciseResult = this.getExerciseResult(splitResult);
-      repaymentHoldingCid = exerciseResult?._1
-        || (Array.isArray(exerciseResult) ? exerciseResult[0] : undefined)
-        || (typeof exerciseResult === 'string' ? exerciseResult : undefined);
-
-      if (!repaymentHoldingCid) {
-        // Fallback: get first created contract from events
-        repaymentHoldingCid = this.getCreatedContractId(splitResult);
-      }
-      if (!repaymentHoldingCid) {
-        console.error('Split result for repayment:', JSON.stringify(splitResult, null, 2).substring(0, 2000));
-        throw new Error('Failed to split holdings for repayment');
+    // Step 2: Auto-accept on behalf of the lender
+    if (transferResult?.transferOfferContractId) {
+      try {
+        await this.acceptUSDCxTransfer(transferResult.transferOfferContractId, lender);
+        console.log(`[USDCx] Lender accepted repayment transfer`);
+      } catch (acceptErr: any) {
+        console.error(`[USDCx] Auto-accept for lender failed: ${acceptErr?.message}`);
+        throw new Error(`USDCx repayment transfer failed: ${acceptErr?.message}`);
       }
     }
 
-    console.log(`Repaying with holding ${repaymentHoldingCid} amount ${repaymentAmount}`);
+    // Step 3: RepayHybrid requires provider, borrower, and lender to sign.
     const repayResult = await this.submitCommand(
       [this.exerciseCmd(
         this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
         loanContractId,
         'RepayHybrid',
-        { repaymentDate: today, repaymentHoldingCid },
+        { repaymentDate: today, repaymentAmount: repaymentAmount.toString() },
       )],
-      [partyId, lender],
+      [this.adminPartyId, partyId, lender],
     );
 
-    // RepayHybrid returns (ContractId SettledLoan, Text) where Text is the ccCollateralReference
-    // Unlock the real Amulet collateral back to the borrower
-    const ccCollateralRef = loan.payload.ccCollateralReference;
-    if (ccCollateralRef) {
+    // Return CC collateral from admin escrow back to the borrower
+    const collateralAmount = parseFloat(loan.payload.collateralAmount || '0');
+    if (collateralAmount > 0) {
       try {
-        console.log(`[Amulet] Unlocking CC collateral ${ccCollateralRef} back to borrower ${partyId}`);
-        await this.unlockAmulet(ccCollateralRef, partyId, userToken);
-        console.log(`[Amulet] Successfully unlocked CC collateral after repayment`);
+        await this.returnCCCollateral(partyId, collateralAmount, userToken);
       } catch (unlockErr) {
-        console.error(`[Amulet] Failed to unlock CC collateral: ${unlockErr}`);
-        // Don't fail the whole repayment - the DAML repayment succeeded
-        // The unlock can be retried manually
+        console.error(`[Amulet] Failed to return CC collateral: ${unlockErr}`);
+        // Don't fail the whole repayment — DAML settlement succeeded
       }
     }
 
@@ -1001,17 +899,16 @@ export class DamlService {
         'ClaimDefaultHybrid',
         { claimDate },
       )],
-      [partyId, borrower],
+      [this.adminPartyId, partyId, borrower],
     );
 
-    // Claim the CC collateral (accept the TransferOffer)
-    const ccCollateralRef = loan.payload.ccCollateralReference;
-    if (ccCollateralRef) {
+    // Send CC collateral from admin escrow to the lender as penalty
+    const collateralAmount = parseFloat(loan.payload.collateralAmount || '0');
+    if (collateralAmount > 0) {
       try {
-        console.log(`[Amulet] Claiming CC collateral ${ccCollateralRef} for lender ${partyId}`);
-        // Accept the transfer offer to claim the CC
-        await this.walletApiFetch(`transfer-offers/${ccCollateralRef}/accept`, 'POST', {}, userToken);
-        console.log(`[Amulet] Successfully claimed CC collateral after default`);
+        console.log(`[Amulet] Sending CC collateral to lender ${partyId} after default`);
+        await this.returnCCCollateral(partyId, collateralAmount, userToken);
+        console.log(`[Amulet] CC collateral successfully transferred to lender`);
       } catch (claimErr) {
         console.error(`[Amulet] Failed to claim CC collateral: ${claimErr}`);
       }
@@ -1158,94 +1055,8 @@ export class DamlService {
   }
 
   // ============================================================================
-  // WALLET OPERATIONS (Direct Transfers)
+  // WALLET OPERATIONS (Transfers)
   // ============================================================================
-
-  /**
-   * Transfer USDC directly from one party to another.
-   * Finds a holding with sufficient balance, splits if needed, then exercises Transfer.
-   */
-  async transferUSDC(senderPartyId: string, recipientPartyId: string, amount: number): Promise<any> {
-    const holdings = await this.queryAssetHoldings(senderPartyId);
-    const usdcHoldings = holdings.filter(
-      h => h.payload.assetType === 'USDC' && h.payload.owner === senderPartyId,
-    );
-
-    if (usdcHoldings.length === 0) {
-      throw new Error(`No USDC holdings found for party ${senderPartyId}`);
-    }
-
-    let holdingToTransfer: AssetHolding | null = null;
-
-    const exactMatch = usdcHoldings.find(h => parseFloat(h.payload.amount) === amount);
-    if (exactMatch) {
-      holdingToTransfer = exactMatch;
-    } else {
-      const largeEnough = usdcHoldings.find(h => parseFloat(h.payload.amount) >= amount);
-      if (!largeEnough) {
-        const totalAvailable = usdcHoldings.reduce((sum, h) => sum + parseFloat(h.payload.amount), 0);
-        throw new Error(`Insufficient USDC balance. Need ${amount}, have ${totalAvailable}`);
-      }
-
-      // Split the holding to get exact amount
-      console.log(`[Transfer] Splitting USDC holding - need ${amount}, have ${largeEnough.payload.amount}`);
-      const splitResult = await this.submitCommand(
-        [this.exerciseCmd(
-          this.templateId('Holding:AssetHolding'),
-          largeEnough.contractId,
-          'Split',
-          { splitAmount: amount.toString() },
-        )],
-        [senderPartyId],
-      );
-
-      const exerciseResult = this.getExerciseResult(splitResult);
-      const splitAmountCid = exerciseResult?._1
-        || (Array.isArray(exerciseResult) ? exerciseResult[0] : undefined)
-        || (typeof exerciseResult === 'string' ? exerciseResult : undefined);
-
-      if (splitAmountCid) {
-        holdingToTransfer = {
-          contractId: splitAmountCid,
-          payload: { ...largeEnough.payload, amount: amount.toString() },
-        };
-      } else {
-        const events = splitResult.transaction?.events || [];
-        const createdEvents = events
-          .map((e: any) => e.CreatedEvent || e.created)
-          .filter((e: any) => e?.contractId);
-        if (createdEvents.length > 0) {
-          holdingToTransfer = {
-            contractId: createdEvents[0].contractId,
-            payload: { ...largeEnough.payload, amount: amount.toString() },
-          };
-        } else {
-          throw new Error('Split did not return expected contract IDs');
-        }
-      }
-    }
-
-    // Exercise Transfer choice
-    console.log(`[Transfer] Transferring ${amount} USDC from ${senderPartyId} to ${recipientPartyId}`);
-    const transferResult = await this.submitCommand(
-      [this.exerciseCmd(
-        this.templateId('Holding:AssetHolding'),
-        holdingToTransfer.contractId,
-        'Transfer',
-        { newOwner: recipientPartyId },
-      )],
-      [senderPartyId, recipientPartyId],
-    );
-
-    console.log(`[Transfer] Successfully transferred ${amount} USDC`);
-    return {
-      success: true,
-      amount,
-      from: senderPartyId,
-      to: recipientPartyId,
-      transactionId: transferResult.transaction?.transactionId,
-    };
-  }
 
   /**
    * Transfer CC (Canton Coins) via token-standard transfer instruction.
@@ -1439,13 +1250,22 @@ export class DamlService {
   }
 
   /**
-   * Get total USDCx balance for a party.
-   * Utility holdings don't have a lock field — returns total as available.
+   * Get USDCx balance for a party, separating locked (in-transit) from available.
+   * Holdings with a lock field are pending transfer acceptance and cannot be spent.
    */
-  async getUSDCxBalance(partyId: string): Promise<{ available: number; total: number }> {
+  async getUSDCxBalance(partyId: string): Promise<{ available: number; locked: number; total: number }> {
     const holdings = await this.getUSDCxHoldings(partyId);
-    const total = holdings.reduce((sum, h) => sum + parseFloat(h.payload?.amount || '0'), 0);
-    return { available: total, total };
+    let available = 0;
+    let locked = 0;
+    for (const h of holdings) {
+      const amount = parseFloat(h.payload?.amount || '0');
+      if (h.payload?.lock) {
+        locked += amount;
+      } else {
+        available += amount;
+      }
+    }
+    return { available, locked, total: available + locked };
   }
 
   /**
@@ -1578,6 +1398,17 @@ export class DamlService {
     const cmdResult = await cmdResponse.json();
     console.log(`[USDCx] Transfer instruction created`);
 
+    // Extract the TransferOffer contract ID from the transaction events
+    const events = cmdResult.transaction?.events || [];
+    let transferOfferContractId: string | undefined;
+    for (const event of events) {
+      const created = event.CreatedEvent || event.created;
+      if (created?.contractId && created?.templateId?.includes('Transfer:TransferOffer')) {
+        transferOfferContractId = created.contractId;
+        break;
+      }
+    }
+
     return {
       success: true,
       amount,
@@ -1585,6 +1416,83 @@ export class DamlService {
       to: recipientPartyId,
       expiresAt: threeDaysLater.toISOString(),
       updateId: cmdResult.transaction?.updateId,
+      transferOfferContractId,
     };
+  }
+
+  /**
+   * Auto-accept a pending USDCx TransferInstruction on behalf of the receiver.
+   * Step 1: Fetch choice context from DA utilities backend.
+   * Step 2: Submit TransferInstruction_Accept via the interface with actAs: [receiverPartyId].
+   */
+  async acceptUSDCxTransfer(transferInstructionCid: string, receiverPartyId: string, userToken?: string): Promise<void> {
+    console.log(`[USDCx] Accepting TransferInstruction ${transferInstructionCid} for receiver ${receiverPartyId}`);
+
+    // Step 1: Get choice context from DA utilities backend
+    const token = userToken || await this.getLedgerApiToken();
+    const contextUrl = `${this.usdcxUtilityBackendUrl}/api/token-standard/v0/registrars/${encodeURIComponent(this.usdcxAdminPartyId)}/registry/transfer-instruction/v1/${transferInstructionCid}/choice-contexts/accept`;
+
+    console.log(`[USDCx] Fetching accept choice context from: ${contextUrl}`);
+    const contextResponse = await this.customFetch(contextUrl, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify({}),
+    });
+
+    if (!contextResponse.ok) {
+      const err = await contextResponse.text();
+      throw new Error(`USDCx accept choice-context failed (${contextResponse.status}): ${err}`);
+    }
+
+    const contextData = await contextResponse.json();
+    console.log(`[USDCx] Got accept choice context`);
+    const choiceContextData = contextData.choiceContextData;
+    const disclosedContracts = contextData.disclosedContracts || [];
+
+    // Step 2: Submit TransferInstruction_Accept via the interface
+    const commandId = `rhein-usdcx-accept-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    const acceptBody = {
+      commands: {
+        userId: this.damlUserId,
+        commandId,
+        workflowId: '',
+        commands: [{
+          ExerciseCommand: {
+            templateId: '#splice-api-token-transfer-instruction-v1:Splice.Api.Token.TransferInstructionV1:TransferInstruction',
+            contractId: transferInstructionCid,
+            choice: 'TransferInstruction_Accept',
+            choiceArgument: {
+              extraArgs: {
+                context: choiceContextData,
+                meta: { values: {} },
+              },
+            },
+          },
+        }],
+        actAs: [receiverPartyId],
+        readAs: [],
+        disclosedContracts,
+        domainId: '',
+        packageIdSelectionPreference: [],
+      },
+    };
+
+    // Always use admin ledger token for command submission — user JWT sub doesn't match Canton ledger user ID
+    const submitToken = await this.getLedgerApiToken();
+    const acceptResponse = await this.customFetch(
+      `${this.jsonApiUrl}/v2/commands/submit-and-wait-for-transaction`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${submitToken}` },
+        body: JSON.stringify(acceptBody),
+      },
+    );
+
+    if (!acceptResponse.ok) {
+      const err = await acceptResponse.text();
+      throw new Error(`USDCx TransferInstruction_Accept failed (${acceptResponse.status}): ${err}`);
+    }
+
+    console.log(`[USDCx] TransferInstruction accepted — USDCx now in receiver's balance`);
   }
 }

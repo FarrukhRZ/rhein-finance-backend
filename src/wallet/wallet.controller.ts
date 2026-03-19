@@ -3,7 +3,6 @@ import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiBearerAuth } from '@ne
 import { WalletService } from './wallet.service';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { User } from '../users/entities/user.entity';
-import { TransferUsdcDto } from './dto/transfer-usdc.dto';
 import { TransferCcDto } from './dto/transfer-cc.dto';
 import { TransferUsdcDto as TransferUsdcxDto } from './dto/transfer-usdc.dto';
 
@@ -14,27 +13,11 @@ export class WalletController {
   constructor(private readonly walletService: WalletService) {}
 
   @Get('balance')
-  @ApiOperation({ summary: 'Get current user wallet balances (USDC + CC)' })
-  @ApiResponse({ status: 200, description: 'Returns USDC and CC balances' })
+  @ApiOperation({ summary: 'Get current user wallet balances (USDCx + CC)' })
+  @ApiResponse({ status: 200, description: 'Returns USDCx and CC balances' })
   async getBalance(@CurrentUser() user: User) {
     const balances = await this.walletService.getBalance(user.partyId);
     return { success: true, data: balances };
-  }
-
-  @Post('transfer/usdc')
-  @ApiOperation({ summary: 'Transfer USDC to another party (instant)' })
-  @ApiResponse({ status: 200, description: 'USDC transferred successfully' })
-  @ApiResponse({ status: 400, description: 'Insufficient balance or invalid recipient' })
-  async transferUSDC(
-    @CurrentUser() user: User,
-    @Body() dto: TransferUsdcDto,
-  ) {
-    const result = await this.walletService.transferUSDC(
-      user.partyId,
-      dto.recipientPartyId,
-      dto.amount,
-    );
-    return { success: true, data: result };
   }
 
   @Post('transfer/cc')
@@ -110,6 +93,26 @@ export class WalletController {
       dto.amount,
       user.rawToken,
     );
+    return { success: true, data: result };
+  }
+
+  @Get('usdcx/transfers')
+  @ApiOperation({ summary: 'List pending incoming USDCx transfers (awaiting acceptance)' })
+  @ApiResponse({ status: 200, description: 'Returns list of pending incoming USDCx TransferOffers' })
+  async listIncomingUSDCxTransfers(@CurrentUser() user: User) {
+    const transfers = await this.walletService.getIncomingUSDCxTransfers(user.partyId);
+    return { success: true, data: transfers };
+  }
+
+  @Post('usdcx/transfers/:contractId/accept')
+  @ApiOperation({ summary: 'Accept a pending incoming USDCx transfer' })
+  @ApiParam({ name: 'contractId', description: 'TransferOffer contract ID' })
+  @ApiResponse({ status: 200, description: 'Transfer accepted, USDCx added to balance' })
+  async acceptUSDCxTransfer(
+    @CurrentUser() user: User,
+    @Param('contractId') contractId: string,
+  ) {
+    const result = await this.walletService.acceptUSDCxTransfer(user.partyId, contractId, user.rawToken);
     return { success: true, data: result };
   }
 

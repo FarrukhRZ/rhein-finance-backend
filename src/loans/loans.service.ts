@@ -36,11 +36,6 @@ export class LoansService {
     return this.damlService.getTokenBalances(partyId);
   }
 
-  async issueTokens(partyId: string) {
-    this.ensureValidPartyId(partyId);
-    return this.damlService.issueTokensToParty(partyId);
-  }
-
   async createOffer(data: {
     partyId: string;
     offerType: 'BorrowerBid' | 'LenderAsk';
