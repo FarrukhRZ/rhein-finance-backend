@@ -4,11 +4,12 @@ import { AdminController } from './admin.controller';
 import { AdminService } from './admin.service';
 import { Party } from './entities/party.entity';
 import { Deposit } from './entities/deposit.entity';
+import { PlatformConfig } from './entities/platform-config.entity';
 import { UsersModule } from '../users/users.module';
 
 @Module({
   imports: [
-    TypeOrmModule.forFeature([Party, Deposit]),
+    TypeOrmModule.forFeature([Party, Deposit, PlatformConfig]),
     UsersModule,
   ],
   controllers: [AdminController],

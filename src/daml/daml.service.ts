@@ -32,6 +32,8 @@ export class DamlService {
   private readonly usdcxUtilityBackendUrl: string;
   private readonly usdcxBridgeOperatorPartyId: string;
   private readonly usdcxUtilityOperatorPartyId: string;
+  private readonly feePartyId: string;
+  private readonly providerPartyId: string;
 
   // Cached Auth0 tokens (keyed by audience)
   private tokenCache: Map<string, { token: string; expiresAt: number }> = new Map();
@@ -57,6 +59,8 @@ export class DamlService {
     this.usdcxUtilityBackendUrl = this.configService.get('USDCX_UTILITY_BACKEND_URL') || 'https://api.utilities.digitalasset-staging.com';
     this.usdcxBridgeOperatorPartyId = this.configService.get('USDCX_BRIDGE_OPERATOR_PARTY_ID') || '';
     this.usdcxUtilityOperatorPartyId = this.configService.get('USDCX_UTILITY_OPERATOR_PARTY_ID') || '';
+    this.feePartyId = this.configService.get('FEE_PARTY_ID') || this.adminPartyId;
+    this.providerPartyId = this.configService.get('PROVIDER_PARTY_ID') || this.adminPartyId;
   }
 
   // ============================================================================
@@ -685,7 +689,7 @@ export class DamlService {
   async queryAllLoanOffers(): Promise<LoanOffer[]> {
     return this.queryContracts(
       [this.templateId('LoanOfferHybrid:LoanOfferHybrid')],
-      [this.adminPartyId],
+      [this.providerPartyId],
     );
   }
 
@@ -719,7 +723,7 @@ export class DamlService {
 
     return this.submitCommand(
       [this.createCmd(this.templateId('LoanOfferHybrid:LoanOfferHybrid'), {
-        provider: this.adminPartyId,
+        provider: this.providerPartyId,
         initiator: partyId,
         counterparty: null,
         offerType: offer.offerType,
@@ -731,9 +735,9 @@ export class DamlService {
         ltvRatio: this.defaultLtv.toString(),
         ccPrice: this.ccPrice.toString(),
         createdAt: today,
-        observers: [this.adminPartyId],
+        observers: [this.providerPartyId],
       })],
-      [this.adminPartyId, partyId],
+      [this.providerPartyId, partyId],
     );
   }
 
@@ -761,7 +765,7 @@ export class DamlService {
         'AcceptHybrid',
         { acceptor: partyId, acceptorCCReference },
       )],
-      [this.adminPartyId, offer.payload.initiator, partyId],
+      [this.providerPartyId, offer.payload.initiator, partyId],
     );
 
     // Disburse USDCx from lender to borrower immediately after loan creation
@@ -785,8 +789,11 @@ export class DamlService {
         senderToken = undefined; // use admin ledger token to act as lender
       }
 
-      console.log(`[USDCx] Disbursing ${loanAmount} USDCx from lender ${lenderPartyId} to borrower ${borrowerPartyId}`);
-      disbursementResult = await this.transferUSDCx(lenderPartyId, borrowerPartyId, loanAmount, senderToken);
+      const fee = Math.round(loanAmount * this.feeRate * 1e6) / 1e6;
+      const borrowerAmount = loanAmount - fee;
+
+      console.log(`[USDCx] Disbursing ${borrowerAmount} USDCx to borrower ${borrowerPartyId} (fee: ${fee} USDCx)`);
+      disbursementResult = await this.transferUSDCx(lenderPartyId, borrowerPartyId, borrowerAmount, senderToken);
       console.log(`[USDCx] Disbursement transfer instruction created successfully`);
 
       // Auto-accept the TransferOffer on behalf of the borrower
@@ -798,6 +805,20 @@ export class DamlService {
         }
       } else {
         console.warn(`[USDCx] No TransferOffer contract ID found in disbursement result — borrower must accept manually`);
+      }
+
+      // Collect protocol fee → provider party
+      if (fee > 0) {
+        try {
+          console.log(`[Fee] Collecting ${fee} USDCx protocol fee from lender to provider`);
+          const feeResult = await this.transferUSDCx(lenderPartyId, this.feePartyId, fee, senderToken);
+          if (feeResult?.transferOfferContractId) {
+            await this.acceptUSDCxTransfer(feeResult.transferOfferContractId, this.feePartyId);
+          }
+          console.log(`[Fee] Protocol fee collected successfully`);
+        } catch (feeErr: any) {
+          console.error(`[Fee] Failed to collect protocol fee: ${feeErr?.message}`);
+        }
       }
     } catch (err: any) {
       disbursementError = err?.message || String(err);
@@ -855,7 +876,7 @@ export class DamlService {
         'RepayHybrid',
         { repaymentDate: today, repaymentAmount: repaymentAmount.toString() },
       )],
-      [this.adminPartyId, partyId, lender],
+      [this.providerPartyId, partyId, lender],
     );
 
     // Return CC collateral from admin escrow back to the borrower
@@ -899,7 +920,7 @@ export class DamlService {
         'ClaimDefaultHybrid',
         { claimDate },
       )],
-      [this.adminPartyId, partyId, borrower],
+      [this.providerPartyId, partyId, borrower],
     );
 
     // Send CC collateral from admin escrow to the lender as penalty
@@ -1274,6 +1295,10 @@ export class DamlService {
    *   2. Call the utility backend transfer-factory endpoint to get factory context
    *   3. Submit DAML ExerciseCommand TransferFactory_Transfer with user's token
    */
+  async transferUSDCxFromFeeParty(recipientPartyId: string, amount: number): Promise<any> {
+    return this.transferUSDCx(this.feePartyId, recipientPartyId, amount);
+  }
+
   async transferUSDCx(senderPartyId: string, recipientPartyId: string, amount: number, userToken?: string): Promise<any> {
     console.log(`[USDCx] Transferring ${amount} USDCx: ${senderPartyId} → ${recipientPartyId}`);
 
@@ -1494,5 +1519,133 @@ export class DamlService {
     }
 
     console.log(`[USDCx] TransferInstruction accepted — USDCx now in receiver's balance`);
+  }
+
+  // ============================================================================
+  // PLATFORM STATS
+  // ============================================================================
+
+  async getPlatformStats(): Promise<any> {
+    const token = await this.getLedgerApiToken();
+    const offset = String(await this.getLedgerEnd());
+
+    const query = async (templateId: string, partyId: string) => {
+      const res = await this.customFetch(`${this.jsonApiUrl}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({
+          activeAtOffset: offset,
+          filter: { filtersByParty: { [partyId]: { cumulative: [{ identifierFilter: { TemplateFilter: { value: { templateId, includeCreatedEventBlob: false } } } }] } } },
+        }),
+      });
+      if (!res.ok) return [];
+      const data = await res.json();
+      return Array.isArray(data) ? data.map((e: any) => e?.contractEntry?.JsActiveContract?.createdEvent) : [];
+    };
+
+    const loanTemplateId = this.templateId('ActiveLoanHybrid:ActiveLoanHybrid');
+    const settledTemplateId = this.templateId('SettledLoan:SettledLoan');
+    const defaultedTemplateId = this.templateId('DefaultedLoan:DefaultedLoan');
+    const validatorCouponId = `${this.amuletPackageId}:Splice.Amulet:ValidatorRewardCoupon`;
+    const appCouponId = `${this.amuletPackageId}:Splice.Amulet:AppRewardCoupon`;
+
+    const [activeLoans, settledLoans, defaultedLoans, validatorCoupons, appCoupons] = await Promise.all([
+      query(loanTemplateId, this.adminPartyId),
+      query(settledTemplateId, this.adminPartyId),
+      query(defaultedTemplateId, this.adminPartyId),
+      query(validatorCouponId, this.adminPartyId),
+      query(appCouponId, this.adminPartyId),
+    ]);
+
+    // Active loan metrics
+    const activeFiltered = activeLoans.filter(Boolean);
+    const totalPrincipal = activeFiltered.reduce((s: number, l: any) => s + parseFloat(l?.createArgument?.loanAmount || '0'), 0);
+    const totalCollateral = activeFiltered.reduce((s: number, l: any) => s + parseFloat(l?.createArgument?.collateralAmount || '0'), 0);
+    const uniqueBorrowers = new Set(activeFiltered.map((l: any) => l?.createArgument?.borrower)).size;
+    const uniqueLenders = new Set(activeFiltered.map((l: any) => l?.createArgument?.lender)).size;
+
+    // Settled loan metrics
+    const settledFiltered = settledLoans.filter(Boolean);
+    const totalRepaid = settledFiltered.reduce((s: number, l: any) => s + parseFloat(l?.createArgument?.repaymentAmount || '0'), 0);
+
+    // Defaulted loan metrics
+    const defaultedFiltered = defaultedLoans.filter(Boolean);
+    const totalDefaulted = defaultedFiltered.reduce((s: number, l: any) => s + parseFloat(l?.createArgument?.loanAmount || '0'), 0);
+
+    // Protocol fee balance (admin's USDCx)
+    const providerUSDCxBalance = await this.getUSDCxBalance(this.feePartyId);
+
+    // Validator rewards
+    const validatorCouponsFiltered = validatorCoupons.filter(Boolean);
+    const totalValidatorRewards = validatorCouponsFiltered.reduce((s: number, c: any) => s + parseFloat(c?.createArgument?.amount || '0'), 0);
+
+    // App rewards
+    const appCouponsFiltered = appCoupons.filter(Boolean);
+    const totalAppRewards = appCouponsFiltered.reduce((s: number, c: any) => s + parseFloat(c?.createArgument?.amount || '0'), 0);
+
+    return {
+      loans: {
+        active: { count: activeFiltered.length, totalPrincipalUSDCx: totalPrincipal, totalCollateralCC: totalCollateral, uniqueBorrowers, uniqueLenders },
+        settled: { count: settledFiltered.length, totalRepaidUSDCx: totalRepaid },
+        defaulted: { count: defaultedFiltered.length, totalDefaultedUSDCx: totalDefaulted },
+      },
+      protocol: {
+        feeRate: this.feeRate,
+        feesCollectedUSDCx: providerUSDCxBalance.available,
+      },
+      rewards: {
+        validatorRewardCoupons: { count: validatorCouponsFiltered.length, totalCC: totalValidatorRewards },
+        appRewardCoupons: { count: appCouponsFiltered.length, totalCC: totalAppRewards },
+      },
+    };
+  }
+
+  async getRewardStats(): Promise<any> {
+    const token = await this.getLedgerApiToken();
+    const offset = String(await this.getLedgerEnd());
+
+    const query = async (templateId: string) => {
+      const res = await this.customFetch(`${this.jsonApiUrl}/v2/state/active-contracts`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+        body: JSON.stringify({
+          activeAtOffset: offset,
+          filter: { filtersByParty: { [this.adminPartyId]: { cumulative: [{ identifierFilter: { TemplateFilter: { value: { templateId, includeCreatedEventBlob: false } } } }] } } },
+        }),
+      });
+      if (!res.ok) return [];
+      const data = await res.json();
+      return Array.isArray(data) ? data.map((e: any) => e?.contractEntry?.JsActiveContract?.createdEvent).filter(Boolean) : [];
+    };
+
+    const [validatorCoupons, appCoupons] = await Promise.all([
+      query(`${this.amuletPackageId}:Splice.Amulet:ValidatorRewardCoupon`),
+      query(`${this.amuletPackageId}:Splice.Amulet:AppRewardCoupon`),
+    ]);
+
+    return {
+      validatorRewardCoupons: {
+        count: validatorCoupons.length,
+        totalCC: validatorCoupons.reduce((s: number, c: any) => s + parseFloat(c?.createArgument?.amount || '0'), 0),
+      },
+      appRewardCoupons: {
+        count: appCoupons.length,
+        totalCC: appCoupons.reduce((s: number, c: any) => s + parseFloat(c?.createArgument?.amount || '0'), 0),
+      },
+    };
+  }
+
+  // ============================================================================
+  // RUNTIME CONFIG
+  // ============================================================================
+
+  private feeRate: number = 0.0075;
+
+  setFeeRate(rate: number): void {
+    this.feeRate = rate;
+  }
+
+  getFeeRate(): number {
+    return this.feeRate;
   }
 }

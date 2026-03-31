@@ -6,6 +6,7 @@ import { execFile } from 'child_process';
 import { promisify } from 'util';
 import { Party } from './entities/party.entity';
 import { Deposit, DepositStatus } from './entities/deposit.entity';
+import { PlatformConfig } from './entities/platform-config.entity';
 import { DamlService } from '../daml/daml.service';
 import { UsersService } from '../users/users.service';
 
@@ -21,12 +22,37 @@ export class AdminService {
     private partyRepository: Repository<Party>,
     @InjectRepository(Deposit)
     private depositRepository: Repository<Deposit>,
+    @InjectRepository(PlatformConfig)
+    private platformConfigRepository: Repository<PlatformConfig>,
     private damlService: DamlService,
     private configService: ConfigService,
     private usersService: UsersService,
   ) {
     this.participantAdminHost = this.configService.get('PARTICIPANT_ADMIN_HOST') || '172.18.0.6';
     this.participantAdminPort = this.configService.get('PARTICIPANT_ADMIN_PORT') || '5002';
+    // Sync fee rate from DB on startup
+    this.getConfig().then(c => this.damlService.setFeeRate(Number(c.feeRate))).catch(() => {});
+  }
+
+  async getConfig(): Promise<PlatformConfig> {
+    let config = await this.platformConfigRepository.findOne({ where: { id: 1 } });
+    if (!config) {
+      config = this.platformConfigRepository.create({ id: 1, feeRate: 0.0075 });
+      await this.platformConfigRepository.save(config);
+    }
+    return config;
+  }
+
+  async updateConfig(updates: { feeRate?: number }): Promise<PlatformConfig> {
+    if (updates.feeRate !== undefined) {
+      if (updates.feeRate < 0 || updates.feeRate > 0.1) {
+        throw new BadRequestException('feeRate must be between 0 and 0.1 (10%)');
+      }
+      this.damlService.setFeeRate(updates.feeRate);
+    }
+    const config = await this.getConfig();
+    Object.assign(config, updates);
+    return this.platformConfigRepository.save(config);
   }
 
   // Helper to validate party ID format
@@ -280,6 +306,56 @@ export class AdminService {
     }
 
     return deposit;
+  }
+
+  async withdrawFees(recipientPartyId: string, amount: number, autoAccept = false) {
+    const feePartyId = this.configService.get('FEE_PARTY_ID');
+    const feeBalance = await this.damlService.getUSDCxBalance(feePartyId);
+    if (amount > feeBalance.available) {
+      throw new BadRequestException(`Insufficient fee balance. Available: ${feeBalance.available} USDCx, requested: ${amount}`);
+    }
+
+    // Transfer from fee party to recipient
+    const result = await this.damlService.transferUSDCxFromFeeParty(recipientPartyId, amount);
+    let accepted = false;
+    if (autoAccept && result?.transferOfferContractId) {
+      await this.damlService.acceptUSDCxTransfer(result.transferOfferContractId, recipientPartyId);
+      accepted = true;
+    }
+
+    return {
+      success: true,
+      amount,
+      recipientPartyId,
+      transferOfferContractId: result?.transferOfferContractId,
+      autoAccepted: accepted,
+      message: accepted
+        ? `${amount} USDCx transferred and accepted by recipient`
+        : `${amount} USDCx transfer pending — recipient must accept contract ${result?.transferOfferContractId}`,
+    };
+  }
+
+  async getPlatformStats() {
+    const [damlStats, totalUsers, onboardedUsers, config, rewards] = await Promise.all([
+      this.damlService.getPlatformStats(),
+      this.partyRepository.query('SELECT COUNT(*) FROM users'),
+      this.partyRepository.query('SELECT COUNT(*) FROM users WHERE "partyId" IS NOT NULL'),
+      this.getConfig(),
+      this.damlService.getRewardStats(),
+    ]);
+
+    return {
+      ...damlStats,
+      users: {
+        total: parseInt(totalUsers[0]?.count || '0'),
+        onboarded: parseInt(onboardedUsers[0]?.count || '0'),
+      },
+      config: {
+        feeRate: Number(config.feeRate),
+        feeRatePercent: `${(Number(config.feeRate) * 100).toFixed(2)}%`,
+      },
+      rewards,
+    };
   }
 
   async getStats() {

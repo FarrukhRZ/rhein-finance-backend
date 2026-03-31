@@ -1,10 +1,11 @@
-import { Controller, Get, Post, Body, Param, Query } from '@nestjs/common';
+import { Controller, Get, Post, Patch, Body, Param, Query } from '@nestjs/common';
 import { ApiTags, ApiOperation, ApiResponse, ApiParam, ApiQuery, ApiBearerAuth } from '@nestjs/swagger';
 import { AdminService } from './admin.service';
 import { Roles } from '../auth/decorators/roles.decorator';
 import { CreatePartyDto } from './dto/create-party.dto';
 import { ApproveDepositDto } from './dto/approve-deposit.dto';
 import { OnboardUserDto } from './dto/onboard-user.dto';
+import { WithdrawFeesDto } from './dto/withdraw-fees.dto';
 
 @ApiTags('admin')
 @ApiBearerAuth()
@@ -97,6 +98,21 @@ export class AdminController {
     };
   }
 
+  @Post('fees/withdraw')
+  @ApiOperation({ summary: 'Withdraw collected protocol fees to a recipient party' })
+  @ApiResponse({ status: 200, description: 'Fee withdrawal initiated' })
+  async withdrawFees(@Body() dto: WithdrawFeesDto) {
+    return this.adminService.withdrawFees(dto.recipientPartyId, dto.amount, dto.autoAccept);
+  }
+
+  @Get('platform-stats')
+  @ApiOperation({ summary: 'Get real-time platform statistics (loans, fees, rewards)' })
+  @ApiResponse({ status: 200, description: 'Returns platform statistics' })
+  async getPlatformStats() {
+    const stats = await this.adminService.getPlatformStats();
+    return { success: true, stats };
+  }
+
   @Get('stats')
   @ApiOperation({ summary: 'Get admin dashboard statistics' })
   @ApiResponse({ status: 200, description: 'Returns dashboard statistics' })
@@ -105,6 +121,36 @@ export class AdminController {
     return {
       success: true,
       stats,
+    };
+  }
+
+  @Get('config')
+  @ApiOperation({ summary: 'Get platform configuration (fee rate, etc.)' })
+  async getConfig() {
+    const config = await this.adminService.getConfig();
+    return {
+      success: true,
+      config: {
+        feeRate: Number(config.feeRate),
+        feeRatePercent: `${(Number(config.feeRate) * 100).toFixed(2)}%`,
+        updatedAt: config.updatedAt,
+      },
+    };
+  }
+
+  @Patch('config')
+  @ApiOperation({ summary: 'Update platform configuration' })
+  @ApiResponse({ status: 200, description: 'Config updated' })
+  @ApiResponse({ status: 400, description: 'Invalid value (feeRate must be 0–10%)' })
+  async updateConfig(@Body() body: { feeRate?: number }) {
+    const config = await this.adminService.updateConfig(body);
+    return {
+      success: true,
+      config: {
+        feeRate: Number(config.feeRate),
+        feeRatePercent: `${(Number(config.feeRate) * 100).toFixed(2)}%`,
+        updatedAt: config.updatedAt,
+      },
     };
   }
 
