@@ -1,0 +1,43 @@
+-- Copyright (c) 2025 RheinFinance. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module DefaultedLoan where
+
+-- | DefaultedLoan represents a loan that was not repaid by maturity (final state).
+-- Lender has claimed the CC collateral reference to seize via Canton API.
+-- Provider is a signatory so Rhein Finance is a confirmer on creation,
+-- attributing traffic weight to the app under CIP-0104.
+template DefaultedLoan
+  with
+    provider : Party          -- Rhein Finance operator party (confirmer for CIP-0104 rewards)
+    borrower : Party
+    lender : Party
+    principal : Decimal
+    collateralClaimed : Decimal
+    defaultDate : Date
+    maturityDate : Date
+  where
+    signatory provider, borrower, lender
+
+    ensure
+      principal > 0.0 &&
+      collateralClaimed > 0.0 &&
+      defaultDate >= maturityDate
+
+    nonconsuming choice GetDefaultDetails : DefaultInfo
+      controller lender
+      do
+        return DefaultInfo with
+          unpaidAmount = principal
+          collateralSeized = collateralClaimed
+          defaultedOn = defaultDate
+          wasMaturityDate = maturityDate
+          outcome = "Default"
+
+data DefaultInfo = DefaultInfo
+  { unpaidAmount : Decimal
+  , collateralSeized : Decimal
+  , defaultedOn : Date
+  , wasMaturityDate : Date
+  , outcome : Text
+  } deriving (Eq, Show)

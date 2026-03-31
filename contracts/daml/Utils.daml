@@ -1,0 +1,72 @@
+-- Copyright (c) 2025 RheinFinance. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Utils where
+
+import DA.Date (subDate)
+
+-- | Fixed CC Price - Canton Coin is valued at $0.125 USD
+-- This is a fixed price used for all loan calculations
+-- In production, this would be replaced with an oracle feed
+ccPrice : Decimal
+ccPrice = 0.125
+
+-- | Calculate simple interest based on principal, rate, and time period
+-- Formula: Interest = Principal × Rate × (Days / 365)
+calculateInterest : Decimal -> Decimal -> Date -> Date -> Decimal
+calculateInterest principal annualRate startDate endDate =
+  let
+    days = subDate endDate startDate
+    daysDecimal = intToDecimal days
+    interest = principal * annualRate * (daysDecimal / 365.0)
+  in
+    interest
+
+-- | Calculate total repayment amount (principal + interest)
+calculateRepaymentAmount : Decimal -> Decimal -> Date -> Date -> Decimal
+calculateRepaymentAmount principal annualRate startDate endDate =
+  let
+    interest = calculateInterest principal annualRate startDate endDate
+  in
+    principal + interest
+
+-- | Calculate required collateral based on loan amount, LTV ratio, and CC price
+-- Formula: Collateral = LoanAmount / (LTV × CCPrice)
+calculateRequiredCollateral : Decimal -> Decimal -> Decimal -> Decimal
+calculateRequiredCollateral loanAmount ltvRatio ccPrice =
+  loanAmount / (ltvRatio * ccPrice)
+
+-- | Calculate loan amount based on collateral, LTV ratio, and CC price
+-- Formula: LoanAmount = Collateral × LTV × CCPrice
+calculateLoanAmount : Decimal -> Decimal -> Decimal -> Decimal
+calculateLoanAmount collateral ltvRatio ccPrice =
+  collateral * ltvRatio * ccPrice
+
+-- | Check if a loan has matured (current date >= maturity date)
+hasMatured : Date -> Date -> Bool
+hasMatured currentDate maturityDate =
+  currentDate >= maturityDate
+
+-- | Validate LTV ratio is within acceptable range (0 < LTV <= 1)
+validateLTV : Decimal -> Bool
+validateLTV ltv =
+  ltv > 0.0 && ltv <= 1.0
+
+-- | Validate interest rate is non-negative and reasonable (0 <= rate <= 1)
+validateInterestRate : Decimal -> Bool
+validateInterestRate rate =
+  rate >= 0.0 && rate <= 1.0
+
+-- | Validate loan amount is positive
+validateAmount : Decimal -> Bool
+validateAmount amount =
+  amount > 0.0
+
+-- | Round decimal to 2 decimal places (for currency precision)
+roundTo2Decimals : Decimal -> Decimal
+roundTo2Decimals value =
+  let
+    scaled = value * 100.0
+    rounded = intToDecimal (truncate scaled)
+  in
+    rounded / 100.0

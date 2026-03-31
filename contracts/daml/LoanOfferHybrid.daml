@@ -1,0 +1,107 @@
+-- Copyright (c) 2025 RheinFinance. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module LoanOfferHybrid where
+
+import DA.Optional (isSome, fromSome)
+import Types
+import Utils
+import ActiveLoanHybrid (ActiveLoanHybrid(..))
+
+-- | LoanOfferHybrid - Uses real Canton Coin for collateral and USDCx for principal.
+-- BorrowerBid: Borrower locks CC collateral on Canton Network, lender disburses USDCx off-chain on accept.
+-- LenderAsk: Lender commits to terms, borrower provides CC collateral on accept, lender disburses USDCx off-chain.
+--
+-- CIP-0104 reward design:
+--   provider is a signatory on the template → Rhein Finance is a confirmer on offer
+--   creation and cancellation.
+--   provider is also a controller on AcceptHybrid → Rhein Finance is a confirmer on
+--   the highest-value event (loan origination), maximising traffic attribution.
+--   provider automation must co-sign AcceptHybrid; this is expected to be a
+--   lightweight, always-available background service on your validator node.
+template LoanOfferHybrid
+  with
+    provider : Party          -- Rhein Finance operator party (confirmer for CIP-0104 rewards)
+    initiator : Party
+    counterparty : Optional Party
+    offerType : OfferType
+    -- For BorrowerBid: locked CC collateral reference (LockedAmulet ContractId as Text)
+    -- For LenderAsk: None (no lock required from lender upfront)
+    lockedCCCollateral : Optional Text
+    loanAmount : Decimal
+    collateralAmount : Decimal
+    interestRate : Decimal
+    maturityDate : Date
+    ltvRatio : Decimal
+    ccPrice : Decimal
+    createdAt : Date
+    observers : [Party]
+  where
+    signatory provider, initiator
+    observer observers
+
+    ensure
+      validateAmount loanAmount &&
+      validateAmount collateralAmount &&
+      validateLTV ltvRatio &&
+      validateInterestRate interestRate &&
+      validateAmount ccPrice &&
+      maturityDate > createdAt &&
+      (case offerType of
+        BorrowerBid -> isSome lockedCCCollateral
+        LenderAsk -> True)
+
+    -- | Accept the loan offer, creating an ActiveLoanHybrid.
+    -- USDCx principal disbursement from lender to borrower happens off-chain after this.
+    -- provider is a controller here — this is the single most important transaction
+    -- for reward attribution (loan origination). provider automation co-signs
+    -- alongside initiator and acceptor.
+    choice AcceptHybrid : ContractId ActiveLoanHybrid
+      with
+        acceptor : Party
+        -- For LenderAsk only: borrower (acceptor) provides their CC collateral reference
+        acceptorCCReference : Optional Text
+      controller provider, initiator, acceptor
+      do
+        (borrower, lenderParty, collateralRef) <- case offerType of
+              BorrowerBid ->
+                -- initiator is borrower (already locked CC), acceptor is lender
+                return (initiator, acceptor, fromSome lockedCCCollateral)
+              LenderAsk -> do
+                -- initiator is lender, acceptor is borrower (provides CC now)
+                assertMsg "Borrower must provide CC collateral reference" (isSome acceptorCCReference)
+                return (acceptor, initiator, fromSome acceptorCCReference)
+
+        create ActiveLoanHybrid with
+          provider = provider
+          borrower = borrower
+          lender = lenderParty
+          ccCollateralReference = collateralRef
+          principal = loanAmount
+          collateralAmount = collateralAmount
+          interestRate = interestRate
+          maturityDate = maturityDate
+          originationDate = createdAt
+          ccPrice = ccPrice
+
+    -- | Cancel the offer.
+    -- provider not added as controller here — cancellations are low value events
+    -- and requiring provider signature would add latency for a non-reward-generating action.
+    -- initiator alone can cancel; provider is still a confirmer as a signatory on the template.
+    choice CancelOfferHybrid : Optional Text
+      controller initiator
+      do
+        return lockedCCCollateral
+
+    -- | Get offer details (read-only)
+    nonconsuming choice GetOfferDetailsHybrid : LoanTerms
+      controller initiator
+      do
+        return LoanTerms with
+          loanAmount = loanAmount
+          collateralAmount = collateralAmount
+          interestRate = interestRate
+          maturityDate = maturityDate
+          originationDate = createdAt
+          ltvRatio = ltvRatio
+          ccPrice = ccPrice

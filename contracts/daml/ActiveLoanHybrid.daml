@@ -1,0 +1,132 @@
+-- Copyright (c) 2025 RheinFinance. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module ActiveLoanHybrid where
+
+import Types
+import Utils
+import SettledLoan (SettledLoan(..))
+import DefaultedLoan (DefaultedLoan(..))
+
+-- | ActiveLoanHybrid - Active loan using CC collateral (on-chain reference) and USDCx principal (off-chain).
+-- CC is locked via Canton Network's LockedAmulet contract (reference stored as Text).
+-- USDCx principal has already been transferred to the borrower off-chain.
+--
+-- CIP-0104 reward design:
+--   provider is a signatory on the template → Rhein Finance is a confirmer on ALL
+--   sub-transactions touching this contract (creation, repayment, default claim).
+--   This maximises traffic weight attributed to the app in every mining round.
+template ActiveLoanHybrid
+  with
+    provider : Party          -- Rhein Finance operator party (confirmer for CIP-0104 rewards)
+    borrower : Party
+    lender : Party
+    ccCollateralReference : Text  -- Reference to LockedAmulet contract on Canton Network
+    principal : Decimal
+    collateralAmount : Decimal
+    interestRate : Decimal
+    maturityDate : Date
+    originationDate : Date
+    ccPrice : Decimal
+  where
+    signatory provider, borrower, lender
+
+    ensure
+      validateAmount principal &&
+      validateAmount collateralAmount &&
+      validateInterestRate interestRate &&
+      maturityDate > originationDate
+
+    -- | Confirm repayment and release CC collateral reference.
+    -- The borrower sends USDCx to the lender off-chain first.
+    -- The lender confirms receipt by co-signing this choice.
+    -- provider co-signs to remain a confirmer on this high-value event,
+    -- ensuring repayment traffic is attributed to Rhein Finance under CIP-0104.
+    -- Returns the CC collateral reference so the borrower can unlock it via Canton API.
+    choice RepayHybrid : (ContractId SettledLoan, Text)
+      with
+        repaymentDate : Date
+        repaymentAmount : Decimal  -- USDCx amount repaid (for record keeping)
+      controller provider, borrower, lender
+      do
+        assertMsg "Cannot repay after maturity date"
+          (repaymentDate <= maturityDate)
+
+        let requiredAmount = calculateRepaymentAmount
+              principal
+              interestRate
+              originationDate
+              repaymentDate
+
+        assertMsg "Repayment amount must equal principal + interest"
+          (abs (repaymentAmount - requiredAmount) < 0.01)
+
+        let interestPaid = repaymentAmount - principal
+
+        settledCid <- create SettledLoan with
+          provider = provider
+          borrower = borrower
+          lender = lender
+          principalRepaid = principal
+          interestPaid = interestPaid
+          collateralReturned = collateralAmount
+          settlementDate = repaymentDate
+
+        return (settledCid, ccCollateralReference)
+
+    -- | Lender claims CC collateral after loan defaults (past maturity, not repaid).
+    -- provider co-signs to remain a confirmer on this high-value event,
+    -- ensuring default-claim traffic is attributed to Rhein Finance under CIP-0104.
+    -- Returns the CC collateral reference so the lender can claim it via Canton API.
+    choice ClaimDefaultHybrid : (ContractId DefaultedLoan, Text)
+      with
+        claimDate : Date
+      controller provider, lender
+      do
+        assertMsg "Can only claim default after maturity date"
+          (hasMatured claimDate maturityDate)
+
+        defaultedCid <- create DefaultedLoan with
+          provider = provider
+          borrower = borrower
+          lender = lender
+          principal = principal
+          collateralClaimed = collateralAmount
+          defaultDate = claimDate
+          maturityDate = maturityDate
+
+        return (defaultedCid, ccCollateralReference)
+
+    -- | Calculate current repayment amount (read-only).
+    -- provider not required as controller — non-consuming, no traffic benefit gained.
+    nonconsuming choice CalculateRepaymentHybrid : Decimal
+      with
+        currentDate : Date
+      controller borrower
+      do
+        return $ calculateRepaymentAmount
+          principal
+          interestRate
+          originationDate
+          currentDate
+
+    -- | Check if loan has matured (read-only)
+    nonconsuming choice CheckMaturityHybrid : Bool
+      with
+        currentDate : Date
+      controller borrower
+      do
+        return $ hasMatured currentDate maturityDate
+
+    -- | Get loan details (read-only)
+    nonconsuming choice GetLoanDetailsHybrid : LoanTerms
+      controller borrower
+      do
+        return LoanTerms with
+          loanAmount = principal
+          collateralAmount = collateralAmount
+          interestRate = interestRate
+          maturityDate = maturityDate
+          originationDate = originationDate
+          ltvRatio = (principal / (collateralAmount * ccPrice))
+          ccPrice = ccPrice

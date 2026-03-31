@@ -1,0 +1,42 @@
+-- Copyright (c) 2025 RheinFinance. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module Types where
+
+-- | Type of loan offer - either a borrower creating a bid or lender creating an ask
+data OfferType
+  = BorrowerBid  -- Borrower initiates, locks CC collateral
+  | LenderAsk    -- Lender initiates, offers terms
+    deriving (Eq, Show)
+
+-- | Loan terms structure containing all key parameters
+data LoanTerms = LoanTerms
+  { loanAmount : Decimal        -- Principal amount in USDCx
+  , collateralAmount : Decimal  -- CC collateral amount
+  , interestRate : Decimal      -- Annual interest rate (e.g., 0.12 for 12%)
+  , maturityDate : Date         -- Loan due date
+  , originationDate : Date      -- Loan start date
+  , ltvRatio : Decimal          -- Loan-to-value ratio (e.g., 0.50 for 50%)
+  , ccPrice : Decimal           -- CC price at origination (fixed)
+  } deriving (Eq, Show)
+
+-- | Loan status for tracking and reporting
+data LoanStatus
+  = OfferPending    -- Offer created, awaiting acceptance
+  | LoanActive      -- Loan active, awaiting repayment or maturity
+  | LoanSettled     -- Successfully repaid
+  | LoanDefaulted   -- Defaulted (not repaid by maturity)
+  | OfferCancelled  -- Offer cancelled by initiator
+    deriving (Eq, Show)
+
+-- | Loan settlement outcome
+data SettlementOutcome
+  = SuccessfulRepayment
+      { repaymentAmount : Decimal
+      , repaymentDate : Date
+      }
+  | DefaultClaim
+      { collateralClaimed : Decimal
+      , defaultDate : Date
+      }
+    deriving (Eq, Show)

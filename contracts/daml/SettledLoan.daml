@@ -1,0 +1,49 @@
+-- Copyright (c) 2025 RheinFinance. All rights reserved.
+-- SPDX-License-Identifier: Apache-2.0
+
+module SettledLoan where
+
+-- | SettledLoan represents a successfully repaid loan (final state).
+-- Provider is a signatory so Rhein Finance is a confirmer on creation,
+-- attributing traffic weight to the app under CIP-0104.
+template SettledLoan
+  with
+    provider : Party          -- Rhein Finance operator party (confirmer for CIP-0104 rewards)
+    borrower : Party
+    lender : Party
+    principalRepaid : Decimal
+    interestPaid : Decimal
+    collateralReturned : Decimal  -- CC collateral returned to borrower (amount)
+    settlementDate : Date
+  where
+    signatory provider, borrower, lender
+
+    ensure
+      principalRepaid > 0.0 &&
+      interestPaid >= 0.0 &&
+      collateralReturned > 0.0
+
+    nonconsuming choice GetTotalRepaid : Decimal
+      controller borrower
+      do
+        return $ principalRepaid + interestPaid
+
+    nonconsuming choice GetSettlementDetails : SettlementInfo
+      controller borrower
+      do
+        return SettlementInfo with
+          totalRepaid = principalRepaid + interestPaid
+          principal = principalRepaid
+          interest = interestPaid
+          collateral = collateralReturned
+          date = settlementDate
+          outcome = "Success"
+
+data SettlementInfo = SettlementInfo
+  { totalRepaid : Decimal
+  , principal : Decimal
+  , interest : Decimal
+  , collateral : Decimal
+  , date : Date
+  , outcome : Text
+  } deriving (Eq, Show)
