@@ -1,11 +1,12 @@
 sdk-version: 3.4.9
 name: rhein-lending-v2
 source: daml
-version: 0.2.0
+version: 0.3.0
 dependencies:
   - daml-prim
   - daml-stdlib
   - daml3-script
-data-dependencies: []
+data-dependencies:
+  - ../dars/splice-api-featured-app-v1-1.0.0.dar
 build-options:
   - --target=2.1

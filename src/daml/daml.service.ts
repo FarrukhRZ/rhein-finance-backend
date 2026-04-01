@@ -39,6 +39,8 @@ export class DamlService {
   private tokenCache: Map<string, { token: string; expiresAt: number }> = new Map();
   // Cached USDCx Burn Mint Factory context (changes infrequently)
   private usdcxContextCache: { factoryId: string; choiceContextData: any; disclosedContracts: any[]; cachedAt: number } | null = null;
+  // Cached FeaturedAppRight contract ID (stable — only changes if re-issued by DSO)
+  private featuredAppRightCidCache: { contractId: string; cachedAt: number } | null = null;
 
   constructor(private configService: ConfigService) {
     this.jsonApiUrl = this.configService.get('JSON_API_URL') || 'http://172.18.0.5:7575';
@@ -435,6 +437,66 @@ export class DamlService {
   }
 
   /**
+   * Fetch the FeaturedAppRight contract ID for the provider party.
+   * Cached for 1 hour — this contract is stable and rarely changes.
+   */
+  async getFeaturedAppRightContractId(): Promise<string> {
+    const CACHE_TTL_MS = 60 * 60 * 1000; // 1 hour
+    if (this.featuredAppRightCidCache && (Date.now() - this.featuredAppRightCidCache.cachedAt) < CACHE_TTL_MS) {
+      return this.featuredAppRightCidCache.contractId;
+    }
+
+    const FEATURED_APP_RIGHT_INTERFACE = '7804375fe5e4c6d5afe067bd314c42fe0b7d005a1300019c73154dd939da4dda:Splice.Api.FeaturedAppRightV1:FeaturedAppRight';
+    const offset = await this.getLatestOffset();
+    const token = await this.getLedgerApiToken();
+
+    const body = {
+      userId: this.damlUserId,
+      filter: {
+        filtersByParty: {
+          [this.providerPartyId]: {
+            cumulative: [{
+              identifierFilter: {
+                InterfaceFilter: {
+                  value: {
+                    interfaceId: FEATURED_APP_RIGHT_INTERFACE,
+                    includeInterfaceView: true,
+                    includeCreatedEventBlob: false,
+                  },
+                },
+              },
+            }],
+          },
+        },
+      },
+      activeAtOffset: offset,
+    };
+
+    const response = await this.customFetch(`${this.jsonApiUrl}/v2/state/active-contracts`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${token}` },
+      body: JSON.stringify(body),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      throw new Error(`FeaturedAppRight query failed (${response.status}): ${errText}`);
+    }
+
+    const data = await response.json();
+    for (const entry of data) {
+      const event = entry.contractEntry?.JsActiveContract?.createdEvent || entry.createdEvent;
+      if (event?.contractId) {
+        this.featuredAppRightCidCache = { contractId: event.contractId, cachedAt: Date.now() };
+        console.log(`[FeaturedAppRight] Found contract: ${event.contractId}`);
+        return event.contractId;
+      }
+    }
+
+    throw new Error(`No FeaturedAppRight contract found for provider party ${this.providerPartyId}. Ensure the DSO has granted FeaturedAppRight to this party.`);
+  }
+
+  /**
    * Submit a command and wait for the transaction result.
    * Uses v2 API with userId auth (no JWT needed).
    *
@@ -758,12 +820,18 @@ export class DamlService {
     // BorrowerBid: lender (acceptor) provides no upfront lock — disburses USDCx off-chain below
 
     console.log(`Accepting offer ${offerContractId} as ${partyId} (initiator: ${offer.payload.initiator})`);
+    let featuredAppRightCidValue: string | null = null;
+    try {
+      featuredAppRightCidValue = await this.getFeaturedAppRightContractId();
+    } catch (err) {
+      console.warn(`[FeaturedAppRight] Could not fetch contract ID, skipping activity marker: ${err}`);
+    }
     const result = await this.submitCommand(
       [this.exerciseCmd(
         this.templateId('LoanOfferHybrid:LoanOfferHybrid'),
         offerContractId,
         'AcceptHybrid',
-        { acceptor: partyId, acceptorCCReference },
+        { acceptor: partyId, acceptorCCReference, featuredAppRightCid: featuredAppRightCidValue },
       )],
       [this.providerPartyId, offer.payload.initiator, partyId],
     );
@@ -869,12 +937,18 @@ export class DamlService {
     }
 
     // Step 3: RepayHybrid requires provider, borrower, and lender to sign.
+    let featuredAppRightCidRepay: string | null = null;
+    try {
+      featuredAppRightCidRepay = await this.getFeaturedAppRightContractId();
+    } catch (err) {
+      console.warn(`[FeaturedAppRight] Could not fetch contract ID for repay, skipping activity marker: ${err}`);
+    }
     const repayResult = await this.submitCommand(
       [this.exerciseCmd(
         this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
         loanContractId,
         'RepayHybrid',
-        { repaymentDate: today, repaymentAmount: repaymentAmount.toString() },
+        { repaymentDate: today, repaymentAmount: repaymentAmount.toString(), featuredAppRightCid: featuredAppRightCidRepay },
       )],
       [this.providerPartyId, partyId, lender],
     );
@@ -913,12 +987,18 @@ export class DamlService {
     const borrower = loan.payload.borrower;
     console.log(`Claiming default on loan ${loanContractId} - Lender: ${partyId}, Borrower: ${borrower}`);
 
+    let featuredAppRightCidDefault: string | null = null;
+    try {
+      featuredAppRightCidDefault = await this.getFeaturedAppRightContractId();
+    } catch (err) {
+      console.warn(`[FeaturedAppRight] Could not fetch contract ID for default, skipping activity marker: ${err}`);
+    }
     const defaultResult = await this.submitCommand(
       [this.exerciseCmd(
         this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
         loanContractId,
         'ClaimDefaultHybrid',
-        { claimDate },
+        { claimDate, featuredAppRightCid: featuredAppRightCidDefault },
       )],
       [this.providerPartyId, partyId, borrower],
     );
