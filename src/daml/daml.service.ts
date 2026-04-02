@@ -33,6 +33,7 @@ export class DamlService {
   private readonly usdcxBridgeOperatorPartyId: string;
   private readonly usdcxUtilityOperatorPartyId: string;
   private readonly feePartyId: string;
+  private readonly escrowPartyId: string;
   private readonly providerPartyId: string;
 
   // Cached Auth0 tokens (keyed by audience)
@@ -62,6 +63,7 @@ export class DamlService {
     this.usdcxBridgeOperatorPartyId = this.configService.get('USDCX_BRIDGE_OPERATOR_PARTY_ID') || '';
     this.usdcxUtilityOperatorPartyId = this.configService.get('USDCX_UTILITY_OPERATOR_PARTY_ID') || '';
     this.feePartyId = this.configService.get('FEE_PARTY_ID') || this.adminPartyId;
+    this.escrowPartyId = this.configService.get('ESCROW_PARTY_ID') || this.adminPartyId;
     this.providerPartyId = this.configService.get('PROVIDER_PARTY_ID') || this.adminPartyId;
   }
 
@@ -567,12 +569,19 @@ export class DamlService {
     return undefined;
   }
 
-  /** Extract the first created contract ID from a submit-and-wait response */
-  private getCreatedContractId(result: any): string | undefined {
+  /** Extract the first created contract ID from a submit-and-wait response.
+   * Optionally filter by template name (matched against the templateId string). */
+  private getCreatedContractId(result: any, templateName?: string): string | undefined {
     const events = result.transaction?.events || [];
     for (const event of events) {
-      if (event.CreatedEvent?.contractId) return event.CreatedEvent.contractId;
-      if (event.created?.contractId) return event.created.contractId;
+      const ev = event.CreatedEvent || event.created;
+      if (!ev?.contractId) continue;
+      if (templateName) {
+        const tid: string = ev.templateId || '';
+        // templateId is like "packageId:Module:Entity" — match the Entity part
+        if (!tid.endsWith(`:${templateName}`)) continue;
+      }
+      return ev.contractId;
     }
     return undefined;
   }
@@ -906,7 +915,9 @@ export class DamlService {
       }
 
       // Activity marker: disbursement acknowledged (CIP-0104)
-      const activeLoanContractId = this.getCreatedContractId(result);
+      // Filter by template name to avoid picking up ActivityMarker contracts created
+      // by the FeaturedAppRight exercise inside AcceptHybrid.
+      const activeLoanContractId = this.getCreatedContractId(result, 'ActiveLoanHybrid');
       if (activeLoanContractId) {
         let farCid: string | null = null;
         try { farCid = await this.getFeaturedAppRightContractId(); } catch (_) {}
