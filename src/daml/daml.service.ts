@@ -231,6 +231,7 @@ export class DamlService {
   }
 
   private async customFetch(url: string, options: any): Promise<any> {
+    const TIMEOUT_MS = 60_000; // 60s — DAML submit-and-wait can be slow
     return new Promise((resolve, reject) => {
       const urlObj = new URL(url);
       const isHttps = urlObj.protocol === 'https:';
@@ -242,6 +243,7 @@ export class DamlService {
         path: urlObj.pathname + urlObj.search,
         method: options.method || 'GET',
         headers: options.headers || {},
+        timeout: TIMEOUT_MS,
       };
 
       const req = client.request(requestOptions, (res) => {
@@ -259,6 +261,9 @@ export class DamlService {
         });
       });
 
+      req.on('timeout', () => {
+        req.destroy(new Error(`Request timed out after ${TIMEOUT_MS}ms: ${options.method || 'GET'} ${url}`));
+      });
       req.on('error', (error) => reject(error));
       if (options.body) req.write(options.body);
       req.end();
@@ -1478,14 +1483,20 @@ export class DamlService {
   async transferUSDCx(senderPartyId: string, recipientPartyId: string, amount: number, userToken?: string): Promise<any> {
     console.log(`[USDCx] Transferring ${amount} USDCx: ${senderPartyId} → ${recipientPartyId}`);
 
-    // Step 1: Get sender's holding CIDs
-    const holdings = await this.getUSDCxHoldings(senderPartyId);
-    const totalBalance = holdings.reduce((s, h) => s + parseFloat(h.payload?.amount || '0'), 0);
-    if (totalBalance < amount) {
-      throw new Error(`Insufficient USDCx balance. Need ${amount}, have ${totalBalance}`);
+    // Step 1: Get sender's holding CIDs — only unlocked (spendable) holdings
+    const allHoldings = await this.getUSDCxHoldings(senderPartyId);
+    const holdings = allHoldings.filter(h => !h.payload?.lock);
+    const availableBalance = holdings.reduce((s, h) => s + parseFloat(h.payload?.amount || '0'), 0);
+    if (availableBalance < amount) {
+      const lockedBalance = allHoldings.filter(h => h.payload?.lock)
+        .reduce((s, h) => s + parseFloat(h.payload?.amount || '0'), 0);
+      throw new Error(
+        `Insufficient available USDCx balance. Need ${amount}, have ${availableBalance} available` +
+        (lockedBalance > 0 ? ` (${lockedBalance} locked/pending)` : ''),
+      );
     }
 
-    // Pick enough holdings to cover the amount
+    // Pick enough unlocked holdings to cover the amount
     let remaining = amount;
     const inputHoldingCids: string[] = [];
     for (const h of holdings) {
