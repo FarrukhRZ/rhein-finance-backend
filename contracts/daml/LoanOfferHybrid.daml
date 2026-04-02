@@ -7,6 +7,7 @@ import DA.Optional (isSome, fromSome)
 import Types
 import Utils
 import ActiveLoanHybrid (ActiveLoanHybrid(..))
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight, FeaturedAppRight_CreateActivityMarker(..), AppRewardBeneficiary(..))
 
 -- | LoanOfferHybrid - Uses real Canton Coin for collateral and USDCx for principal.
 -- BorrowerBid: Borrower locks CC collateral on Canton Network, lender disburses USDCx off-chain on accept.
@@ -61,6 +62,7 @@ template LoanOfferHybrid
         acceptor : Party
         -- For LenderAsk only: borrower (acceptor) provides their CC collateral reference
         acceptorCCReference : Optional Text
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
       controller provider, initiator, acceptor
       do
         (borrower, lenderParty, collateralRef) <- case offerType of
@@ -71,6 +73,14 @@ template LoanOfferHybrid
                 -- initiator is lender, acceptor is borrower (provides CC now)
                 assertMsg "Borrower must provide CC collateral reference" (isSome acceptorCCReference)
                 return (acceptor, initiator, fromSome acceptorCCReference)
+
+        -- Record activity marker for CIP-0104 app rewards (loan origination)
+        case featuredAppRightCid of
+          Some cid -> do
+            exercise cid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with beneficiary = provider; weight = 1.0]
+            return ()
+          None -> return ()
 
         create ActiveLoanHybrid with
           provider = provider
@@ -83,6 +93,21 @@ template LoanOfferHybrid
           maturityDate = maturityDate
           originationDate = createdAt
           ccPrice = ccPrice
+
+    -- | Register offer activity marker for CIP-0104 rewards.
+    -- Called by provider immediately after offer creation.
+    -- Nonconsuming so it doesn't archive the offer — just creates an activity marker.
+    nonconsuming choice RegisterOfferHybrid : ()
+      with
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller provider
+      do
+        case featuredAppRightCid of
+          Some cid -> do
+            exercise cid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with beneficiary = provider; weight = 1.0]
+            return ()
+          None -> return ()
 
     -- | Cancel the offer.
     -- provider not added as controller here — cancellations are low value events

@@ -783,7 +783,7 @@ export class DamlService {
     }
     // LenderAsk: no upfront locking needed — lender disburses USDCx off-chain after acceptance
 
-    return this.submitCommand(
+    const createResult = await this.submitCommand(
       [this.createCmd(this.templateId('LoanOfferHybrid:LoanOfferHybrid'), {
         provider: this.providerPartyId,
         initiator: partyId,
@@ -801,6 +801,36 @@ export class DamlService {
       })],
       [this.providerPartyId, partyId],
     );
+
+    // Register activity marker for CIP-0104 rewards (offer creation)
+    const offerContractId = createResult?.transaction?.events
+      ?.find((e: any) => e.CreatedEvent)?.CreatedEvent?.contractId
+      || createResult?.contractId;
+
+    if (offerContractId) {
+      let featuredAppRightCid: string | null = null;
+      try {
+        featuredAppRightCid = await this.getFeaturedAppRightContractId();
+      } catch (err) {
+        console.warn(`[FeaturedAppRight] Skipping offer marker: ${err}`);
+      }
+      try {
+        await this.submitCommand(
+          [this.exerciseCmd(
+            this.templateId('LoanOfferHybrid:LoanOfferHybrid'),
+            offerContractId,
+            'RegisterOfferHybrid',
+            { featuredAppRightCid },
+          )],
+          [this.providerPartyId],
+        );
+        console.log(`[FeaturedAppRight] Offer marker created for ${offerContractId}`);
+      } catch (err) {
+        console.warn(`[FeaturedAppRight] RegisterOfferHybrid failed (non-fatal): ${err}`);
+      }
+    }
+
+    return createResult;
   }
 
   async acceptLoanOffer(partyId: string, offerContractId: string, offer: LoanOffer, userToken?: string): Promise<any> {
