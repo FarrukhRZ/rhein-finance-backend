@@ -30,7 +30,7 @@ async function bootstrap() {
   app.useGlobalPipes(
     new ValidationPipe({
       whitelist: true,
-      forbidNonWhitelisted: false,
+      forbidNonWhitelisted: true,
       transform: true,
       transformOptions: {
         enableImplicitConversion: true,
@@ -68,11 +68,13 @@ async function bootstrap() {
     .addTag('explorer', 'Transaction explorer')
     .build();
 
-  const document = SwaggerModule.createDocument(app, config);
-  SwaggerModule.setup('api/docs', app, document, {
-    customSiteTitle: 'Rhein Finance API Docs',
-    customCss: '.swagger-ui .topbar { display: none }',
-  });
+  if (configService.get('NODE_ENV') !== 'production') {
+    const document = SwaggerModule.createDocument(app, config);
+    SwaggerModule.setup('api/docs', app, document, {
+      customSiteTitle: 'Rhein Finance API Docs',
+      customCss: '.swagger-ui .topbar { display: none }',
+    });
+  }
 
   const port = configService.get('PORT') || 3001;
   await app.listen(port);

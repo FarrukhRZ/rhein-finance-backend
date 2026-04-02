@@ -1,4 +1,4 @@
-import { IsNotEmpty, IsNumber } from 'class-validator';
+import { IsNotEmpty, IsNumber, Min } from 'class-validator';
 import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 
@@ -7,5 +7,6 @@ export class RepayLoanDto {
   @IsNumber()
   @Type(() => Number)
   @IsNotEmpty()
+  @Min(0.000001, { message: 'repaymentAmount must be a positive number' })
   repaymentAmount: number;
 }

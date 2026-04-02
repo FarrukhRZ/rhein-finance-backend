@@ -1,6 +1,5 @@
 import { Injectable, BadRequestException } from '@nestjs/common';
 import { DamlService } from '../daml/daml.service';
-import { LoanOffer } from '../daml/interfaces';
 
 @Injectable()
 export class LoansService {
@@ -54,9 +53,9 @@ export class LoansService {
     }, userToken);
   }
 
-  async acceptOffer(contractId: string, partyId: string, offer: LoanOffer, userToken?: string) {
+  async acceptOffer(contractId: string, partyId: string, userToken?: string) {
     this.ensureValidPartyId(partyId);
-    return this.damlService.acceptLoanOffer(partyId, contractId, offer, userToken);
+    return this.damlService.acceptLoanOffer(partyId, contractId, null as any, userToken);
   }
 
   async repayLoan(contractId: string, partyId: string, repaymentAmount: number, userToken?: string) {

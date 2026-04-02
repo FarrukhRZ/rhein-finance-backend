@@ -5,7 +5,6 @@ import { Public } from '../auth/decorators/public.decorator';
 import { CurrentUser } from '../auth/decorators/current-user.decorator';
 import { User } from '../users/entities/user.entity';
 import { CreateOfferDto } from './dto/create-offer.dto';
-import { AcceptOfferDto } from './dto/accept-offer.dto';
 import { RepayLoanDto } from './dto/repay-loan.dto';
 import { DefaultLoanDto } from './dto/default-loan.dto';
 
@@ -52,12 +51,9 @@ export class LoansController {
   async acceptOffer(
     @CurrentUser() user: User,
     @Param('contractId') contractId: string,
-    @Body() dto: AcceptOfferDto
   ) {
-    if (dto.offer?.payload?.initiator === user.partyId) {
-      throw new ForbiddenException('Cannot accept your own loan offer');
-    }
-    const result = await this.loansService.acceptOffer(contractId, user.partyId, dto.offer, user.rawToken);
+    // Offer payload is fetched from the ledger inside the service — no body needed
+    const result = await this.loansService.acceptOffer(contractId, user.partyId, user.rawToken);
     return { success: true, data: result };
   }
 
@@ -101,6 +97,10 @@ export class LoansController {
     @Param('contractId') contractId: string,
     @Body() dto: DefaultLoanDto
   ) {
+    // claimDate override is admin-only — regular users always use today's date
+    if (dto.claimDate && user.role !== 'admin') {
+      throw new ForbiddenException('claimDate override requires admin role');
+    }
     const result = await this.loansService.defaultLoan(contractId, user.partyId, dto.claimDate, user.rawToken);
     return { success: true, data: result };
   }

@@ -157,10 +157,14 @@ export class AdminController {
   @Post('database/clear')
   @ApiOperation({
     summary: 'Clear all database records',
-    description: 'Deletes all parties and deposits from the database. Useful when restarting the ledger.'
+    description: 'Deletes all parties and deposits. Requires { "confirm": "DELETE_ALL_DATA" } in the request body.'
   })
   @ApiResponse({ status: 200, description: 'Database cleared successfully' })
-  async clearDatabase() {
+  @ApiResponse({ status: 400, description: 'Missing or invalid confirmation token' })
+  async clearDatabase(@Body() body: { confirm?: string }) {
+    if (body?.confirm !== 'DELETE_ALL_DATA') {
+      throw new Error('Must pass { "confirm": "DELETE_ALL_DATA" } to confirm this destructive action');
+    }
     return this.adminService.clearDatabase();
   }
 }

@@ -762,6 +762,15 @@ export class DamlService {
     );
   }
 
+  async getLoanOfferByContractId(contractId: string): Promise<LoanOffer | null> {
+    // Fetch via provider party (which is signatory on all offers)
+    const offers = await this.queryContracts(
+      [this.templateId('LoanOfferHybrid:LoanOfferHybrid')],
+      [this.providerPartyId],
+    );
+    return offers.find(o => o.contractId === contractId) || null;
+  }
+
   async queryAllLoanOffers(): Promise<LoanOffer[]> {
     return this.queryContracts(
       [this.templateId('LoanOfferHybrid:LoanOfferHybrid')],
@@ -847,7 +856,19 @@ export class DamlService {
     return createResult;
   }
 
-  async acceptLoanOffer(partyId: string, offerContractId: string, offer: LoanOffer, userToken?: string): Promise<any> {
+  async acceptLoanOffer(partyId: string, offerContractId: string, _clientOffer: LoanOffer, userToken?: string): Promise<any> {
+    // SECURITY: Always fetch offer from the ledger — never trust the client-supplied payload
+    // for financial logic (amounts, roles, parties). The client payload is ignored entirely.
+    const offer = await this.getLoanOfferByContractId(offerContractId);
+    if (!offer) {
+      throw new Error(`Offer ${offerContractId} not found on ledger`);
+    }
+
+    // Prevent accepting your own offer (ledger-verified)
+    if (offer.payload.initiator === partyId) {
+      throw new Error('Cannot accept your own loan offer');
+    }
+
     let acceptorCCReference: string | null = null;
 
     if (offer.payload.offerType === 'LenderAsk') {
