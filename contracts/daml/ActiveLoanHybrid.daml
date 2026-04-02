@@ -7,6 +7,7 @@ import Types
 import Utils
 import SettledLoan (SettledLoan(..))
 import DefaultedLoan (DefaultedLoan(..))
+import Splice.Api.FeaturedAppRightV1 (FeaturedAppRight, FeaturedAppRight_CreateActivityMarker(..), AppRewardBeneficiary(..))
 
 -- | ActiveLoanHybrid - Active loan using CC collateral (on-chain reference) and USDCx principal (off-chain).
 -- CC is locked via Canton Network's LockedAmulet contract (reference stored as Text).
@@ -47,6 +48,7 @@ template ActiveLoanHybrid
       with
         repaymentDate : Date
         repaymentAmount : Decimal  -- USDCx amount repaid (for record keeping)
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
       controller provider, borrower, lender
       do
         assertMsg "Cannot repay after maturity date"
@@ -62,6 +64,14 @@ template ActiveLoanHybrid
           (abs (repaymentAmount - requiredAmount) < 0.01)
 
         let interestPaid = repaymentAmount - principal
+
+        -- Record activity marker for CIP-0104 app rewards (loan repayment)
+        case featuredAppRightCid of
+          Some cid -> do
+            exercise cid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with beneficiary = provider; weight = 1.0]
+            return ()
+          None -> return ()
 
         settledCid <- create SettledLoan with
           provider = provider
@@ -81,10 +91,19 @@ template ActiveLoanHybrid
     choice ClaimDefaultHybrid : (ContractId DefaultedLoan, Text)
       with
         claimDate : Date
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
       controller provider, lender
       do
         assertMsg "Can only claim default after maturity date"
           (hasMatured claimDate maturityDate)
+
+        -- Record activity marker for CIP-0104 app rewards (default claim)
+        case featuredAppRightCid of
+          Some cid -> do
+            exercise cid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with beneficiary = provider; weight = 1.0]
+            return ()
+          None -> return ()
 
         defaultedCid <- create DefaultedLoan with
           provider = provider
@@ -96,6 +115,34 @@ template ActiveLoanHybrid
           maturityDate = maturityDate
 
         return (defaultedCid, ccCollateralReference)
+
+    -- | Acknowledge USDCx disbursement to borrower (CIP-0104 marker).
+    -- Called by provider after USDCx is successfully transferred to borrower.
+    nonconsuming choice AcknowledgeDisbursementHybrid : ()
+      with
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller provider
+      do
+        case featuredAppRightCid of
+          Some cid -> do
+            exercise cid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with beneficiary = provider; weight = 1.0]
+            return ()
+          None -> return ()
+
+    -- | Record CC collateral return to borrower/lender (CIP-0104 marker).
+    -- Called by provider after CC collateral is returned on repay or default.
+    nonconsuming choice RecordCollateralReturnHybrid : ()
+      with
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller provider
+      do
+        case featuredAppRightCid of
+          Some cid -> do
+            exercise cid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with beneficiary = provider; weight = 1.0]
+            return ()
+          None -> return ()
 
     -- | Calculate current repayment amount (read-only).
     -- provider not required as controller — non-consuming, no traffic benefit gained.

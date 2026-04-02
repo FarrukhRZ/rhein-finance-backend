@@ -905,6 +905,27 @@ export class DamlService {
         console.warn(`[USDCx] No TransferOffer contract ID found in disbursement result — borrower must accept manually`);
       }
 
+      // Activity marker: disbursement acknowledged (CIP-0104)
+      const activeLoanContractId = this.getCreatedContractId(result);
+      if (activeLoanContractId) {
+        let farCid: string | null = null;
+        try { farCid = await this.getFeaturedAppRightContractId(); } catch (_) {}
+        try {
+          await this.submitCommand(
+            [this.exerciseCmd(
+              this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
+              activeLoanContractId,
+              'AcknowledgeDisbursementHybrid',
+              { featuredAppRightCid: farCid },
+            )],
+            [this.providerPartyId],
+          );
+          console.log(`[FeaturedAppRight] Disbursement marker created`);
+        } catch (err) {
+          console.warn(`[FeaturedAppRight] AcknowledgeDisbursementHybrid failed (non-fatal): ${err}`);
+        }
+      }
+
       // Collect protocol fee → provider party
       if (fee > 0) {
         try {
@@ -973,6 +994,23 @@ export class DamlService {
     } catch (err) {
       console.warn(`[FeaturedAppRight] Could not fetch contract ID for repay, skipping activity marker: ${err}`);
     }
+
+    // Activity marker: collateral return (before RepayHybrid archives the loan)
+    try {
+      await this.submitCommand(
+        [this.exerciseCmd(
+          this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
+          loanContractId,
+          'RecordCollateralReturnHybrid',
+          { featuredAppRightCid: featuredAppRightCidRepay },
+        )],
+        [this.providerPartyId],
+      );
+      console.log(`[FeaturedAppRight] Collateral return marker created`);
+    } catch (err) {
+      console.warn(`[FeaturedAppRight] RecordCollateralReturnHybrid failed (non-fatal): ${err}`);
+    }
+
     const repayResult = await this.submitCommand(
       [this.exerciseCmd(
         this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
@@ -1023,6 +1061,23 @@ export class DamlService {
     } catch (err) {
       console.warn(`[FeaturedAppRight] Could not fetch contract ID for default, skipping activity marker: ${err}`);
     }
+
+    // Activity marker: collateral return (before ClaimDefaultHybrid archives the loan)
+    try {
+      await this.submitCommand(
+        [this.exerciseCmd(
+          this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
+          loanContractId,
+          'RecordCollateralReturnHybrid',
+          { featuredAppRightCid: featuredAppRightCidDefault },
+        )],
+        [this.providerPartyId],
+      );
+      console.log(`[FeaturedAppRight] Collateral return marker created (default)`);
+    } catch (err) {
+      console.warn(`[FeaturedAppRight] RecordCollateralReturnHybrid failed (non-fatal): ${err}`);
+    }
+
     const defaultResult = await this.submitCommand(
       [this.exerciseCmd(
         this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
