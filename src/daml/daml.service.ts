@@ -556,6 +556,11 @@ export class DamlService {
     return { ExerciseCommand: { templateId, contractId, choice, choiceArgument } };
   }
 
+  /** Build a CreateAndExerciseCommand — atomically creates a contract and exercises a choice on it */
+  private createAndExerciseCmd(templateId: string, createArguments: any, choice: string, choiceArgument: any) {
+    return { CreateAndExerciseCommand: { templateId, createArguments, choice, choiceArgument } };
+  }
+
   /**
    * Extract the exercise result from a submit-and-wait response.
    * Events are wrapped in discriminators like CreatedEvent, ExercisedEvent.
@@ -806,53 +811,40 @@ export class DamlService {
     }
     // LenderAsk: no upfront locking needed — lender disburses USDCx off-chain after acceptance
 
+    // Fetch FeaturedAppRight CID upfront (non-fatal if not found)
+    let featuredAppRightCid: string | null = null;
+    try {
+      featuredAppRightCid = await this.getFeaturedAppRightContractId();
+    } catch (err) {
+      console.warn(`[FeaturedAppRight] Skipping offer marker: ${err}`);
+    }
+
+    // Batch offer creation + RegisterOfferHybrid into a single Canton transaction
     const createResult = await this.submitCommand(
-      [this.createCmd(this.templateId('LoanOfferHybrid:LoanOfferHybrid'), {
-        provider: this.providerPartyId,
-        initiator: partyId,
-        counterparty: null,
-        offerType: offer.offerType,
-        lockedCCCollateral,
-        loanAmount: offer.loanAmount,
-        collateralAmount: offer.collateralAmount,
-        interestRate: offer.interestRate,
-        maturityDate: offer.maturityDate,
-        ltvRatio: this.defaultLtv.toString(),
-        ccPrice: this.ccPrice.toString(),
-        createdAt: today,
-        observers: [this.providerPartyId],
-      })],
+      [this.createAndExerciseCmd(
+        this.templateId('LoanOfferHybrid:LoanOfferHybrid'),
+        {
+          provider: this.providerPartyId,
+          initiator: partyId,
+          counterparty: null,
+          offerType: offer.offerType,
+          lockedCCCollateral,
+          loanAmount: offer.loanAmount,
+          collateralAmount: offer.collateralAmount,
+          interestRate: offer.interestRate,
+          maturityDate: offer.maturityDate,
+          ltvRatio: this.defaultLtv.toString(),
+          ccPrice: this.ccPrice.toString(),
+          createdAt: today,
+          observers: [this.providerPartyId],
+        },
+        'RegisterOfferHybrid',
+        { featuredAppRightCid },
+      )],
       [this.providerPartyId, partyId],
     );
 
-    // Register activity marker for CIP-0104 rewards (offer creation)
-    const offerContractId = createResult?.transaction?.events
-      ?.find((e: any) => e.CreatedEvent)?.CreatedEvent?.contractId
-      || createResult?.contractId;
-
-    if (offerContractId) {
-      let featuredAppRightCid: string | null = null;
-      try {
-        featuredAppRightCid = await this.getFeaturedAppRightContractId();
-      } catch (err) {
-        console.warn(`[FeaturedAppRight] Skipping offer marker: ${err}`);
-      }
-      try {
-        await this.submitCommand(
-          [this.exerciseCmd(
-            this.templateId('LoanOfferHybrid:LoanOfferHybrid'),
-            offerContractId,
-            'RegisterOfferHybrid',
-            { featuredAppRightCid },
-          )],
-          [this.providerPartyId],
-        );
-        console.log(`[FeaturedAppRight] Offer marker created for ${offerContractId}`);
-      } catch (err) {
-        console.warn(`[FeaturedAppRight] RegisterOfferHybrid failed (non-fatal): ${err}`);
-      }
-    }
-
+    console.log(`[FeaturedAppRight] Offer creation + RegisterOfferHybrid submitted atomically`);
     return createResult;
   }
 
@@ -940,28 +932,9 @@ export class DamlService {
         console.warn(`[USDCx] No TransferOffer contract ID found in disbursement result — borrower must accept manually`);
       }
 
-      // Activity marker: disbursement acknowledged (CIP-0104)
       // Filter by template name to avoid picking up ActivityMarker contracts created
       // by the FeaturedAppRight exercise inside AcceptHybrid.
       const activeLoanContractId = this.getCreatedContractId(result, 'ActiveLoanHybrid');
-      if (activeLoanContractId) {
-        let farCid: string | null = null;
-        try { farCid = await this.getFeaturedAppRightContractId(); } catch (_) {}
-        try {
-          await this.submitCommand(
-            [this.exerciseCmd(
-              this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
-              activeLoanContractId,
-              'AcknowledgeDisbursementHybrid',
-              { featuredAppRightCid: farCid },
-            )],
-            [this.providerPartyId],
-          );
-          console.log(`[FeaturedAppRight] Disbursement marker created`);
-        } catch (err) {
-          console.warn(`[FeaturedAppRight] AcknowledgeDisbursementHybrid failed (non-fatal): ${err}`);
-        }
-      }
 
       // Collect protocol fee → provider party
       if (fee > 0) {
@@ -974,6 +947,34 @@ export class DamlService {
           console.log(`[Fee] Protocol fee collected successfully`);
         } catch (feeErr: any) {
           console.error(`[Fee] Failed to collect protocol fee: ${feeErr?.message}`);
+        }
+      }
+
+      // Batch AcknowledgeDisbursementHybrid + RecordFeeCollectionHybrid into one transaction
+      if (activeLoanContractId) {
+        let farCid: string | null = null;
+        try { farCid = await this.getFeaturedAppRightContractId(); } catch (_) {}
+        try {
+          await this.submitCommand(
+            [
+              this.exerciseCmd(
+                this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
+                activeLoanContractId,
+                'AcknowledgeDisbursementHybrid',
+                { featuredAppRightCid: farCid },
+              ),
+              this.exerciseCmd(
+                this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
+                activeLoanContractId,
+                'RecordFeeCollectionHybrid',
+                { featuredAppRightCid: farCid },
+              ),
+            ],
+            [this.providerPartyId],
+          );
+          console.log(`[FeaturedAppRight] Disbursement + fee collection markers created (batched)`);
+        } catch (err) {
+          console.warn(`[FeaturedAppRight] Batched disbursement/fee markers failed (non-fatal): ${err}`);
         }
       }
     } catch (err: any) {
@@ -1032,31 +1033,25 @@ export class DamlService {
       console.warn(`[FeaturedAppRight] Could not fetch contract ID for repay, skipping activity marker: ${err}`);
     }
 
-    // Activity marker: collateral return (before RepayHybrid archives the loan)
-    try {
-      await this.submitCommand(
-        [this.exerciseCmd(
+    // Batch RecordCollateralReturnHybrid (nonconsuming) + RepayHybrid (consuming) in one transaction
+    const repayResult = await this.submitCommand(
+      [
+        this.exerciseCmd(
           this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
           loanContractId,
           'RecordCollateralReturnHybrid',
           { featuredAppRightCid: featuredAppRightCidRepay },
-        )],
-        [this.providerPartyId],
-      );
-      console.log(`[FeaturedAppRight] Collateral return marker created`);
-    } catch (err) {
-      console.warn(`[FeaturedAppRight] RecordCollateralReturnHybrid failed (non-fatal): ${err}`);
-    }
-
-    const repayResult = await this.submitCommand(
-      [this.exerciseCmd(
-        this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
-        loanContractId,
-        'RepayHybrid',
-        { repaymentDate: today, repaymentAmount: repaymentAmount.toString(), featuredAppRightCid: featuredAppRightCidRepay },
-      )],
+        ),
+        this.exerciseCmd(
+          this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
+          loanContractId,
+          'RepayHybrid',
+          { repaymentDate: today, repaymentAmount: repaymentAmount.toString(), featuredAppRightCid: featuredAppRightCidRepay },
+        ),
+      ],
       [this.providerPartyId, partyId, lender],
     );
+    console.log(`[FeaturedAppRight] Collateral return + repayment submitted (batched)`);
 
     // Return CC collateral from admin escrow back to the borrower
     const collateralAmount = parseFloat(loan.payload.collateralAmount || '0');
@@ -1099,31 +1094,25 @@ export class DamlService {
       console.warn(`[FeaturedAppRight] Could not fetch contract ID for default, skipping activity marker: ${err}`);
     }
 
-    // Activity marker: collateral return (before ClaimDefaultHybrid archives the loan)
-    try {
-      await this.submitCommand(
-        [this.exerciseCmd(
+    // Batch RecordCollateralReturnHybrid (nonconsuming) + ClaimDefaultHybrid (consuming) in one transaction
+    const defaultResult = await this.submitCommand(
+      [
+        this.exerciseCmd(
           this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
           loanContractId,
           'RecordCollateralReturnHybrid',
           { featuredAppRightCid: featuredAppRightCidDefault },
-        )],
-        [this.providerPartyId],
-      );
-      console.log(`[FeaturedAppRight] Collateral return marker created (default)`);
-    } catch (err) {
-      console.warn(`[FeaturedAppRight] RecordCollateralReturnHybrid failed (non-fatal): ${err}`);
-    }
-
-    const defaultResult = await this.submitCommand(
-      [this.exerciseCmd(
-        this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
-        loanContractId,
-        'ClaimDefaultHybrid',
-        { claimDate, featuredAppRightCid: featuredAppRightCidDefault },
-      )],
+        ),
+        this.exerciseCmd(
+          this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
+          loanContractId,
+          'ClaimDefaultHybrid',
+          { claimDate, featuredAppRightCid: featuredAppRightCidDefault },
+        ),
+      ],
       [this.providerPartyId, partyId, borrower],
     );
+    console.log(`[FeaturedAppRight] Collateral return + default claim submitted (batched)`);
 
     // Send CC collateral from admin escrow to the lender as penalty
     const collateralAmount = parseFloat(loan.payload.collateralAmount || '0');

@@ -200,15 +200,16 @@ All endpoints are prefixed `/api`. JWT bearer token required unless noted.
 
 ## CIP-0104 App Rewards
 
-Every loan lifecycle generates **5 activity markers** via `FeaturedAppRight_CreateActivityMarker`:
+Every loan lifecycle generates **6 activity markers** via `FeaturedAppRight_CreateActivityMarker`:
 
 | # | Event | Choice |
 |---|-------|--------|
-| 1 | Offer created | `RegisterOfferHybrid` |
+| 1 | Offer created | `RegisterOfferHybrid` (batched with create via `CreateAndExercise`) |
 | 2 | Loan originated | `AcceptHybrid` |
 | 3 | USDCx disbursed | `AcknowledgeDisbursementHybrid` |
-| 4 | Collateral returned | `RecordCollateralReturnHybrid` |
-| 5 | Loan settled / defaulted | `RepayHybrid` / `ClaimDefaultHybrid` |
+| 4 | Protocol fee collected | `RecordFeeCollectionHybrid` |
+| 5 | Collateral returned | `RecordCollateralReturnHybrid` |
+| 6 | Loan settled / defaulted | `RepayHybrid` / `ClaimDefaultHybrid` |
 
 `provider` is a signatory on all DAML templates, ensuring Rhein Finance is a confirmer on every sub-transaction regardless of marker creation.
 

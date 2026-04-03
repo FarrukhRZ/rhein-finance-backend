@@ -144,6 +144,20 @@ template ActiveLoanHybrid
             return ()
           None -> return ()
 
+    -- | Record protocol fee collection (CIP-0104 marker).
+    -- Called by provider after USDCx protocol fee is collected from lender at loan origination.
+    nonconsuming choice RecordFeeCollectionHybrid : ()
+      with
+        featuredAppRightCid : Optional (ContractId FeaturedAppRight)
+      controller provider
+      do
+        case featuredAppRightCid of
+          Some cid -> do
+            exercise cid FeaturedAppRight_CreateActivityMarker with
+              beneficiaries = [AppRewardBeneficiary with beneficiary = provider; weight = 1.0]
+            return ()
+          None -> return ()
+
     -- | Calculate current repayment amount (read-only).
     -- provider not required as controller — non-consuming, no traffic benefit gained.
     nonconsuming choice CalculateRepaymentHybrid : Decimal
