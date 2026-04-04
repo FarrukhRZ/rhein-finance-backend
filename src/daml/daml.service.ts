@@ -113,14 +113,15 @@ export class DamlService implements OnModuleInit {
     console.log(`[Startup] TransferPreapproval created for ${partyId.split('::')[0]}`);
   }
 
-  private async hasCCTransferPreapproval(partyId: string): Promise<boolean> {
+  private async getCCTransferPreapprovalContractId(partyId: string): Promise<string | null> {
     const template = `${this.amuletPackageId}:Splice.AmuletRules:TransferPreapproval`;
     const existing = await this.queryContracts([template], [partyId]);
-    return existing.some((c: any) => c.payload?.receiver === partyId);
+    const match = existing.find((c: any) => c.payload?.receiver === partyId);
+    return match?.contractId ?? null;
   }
 
   private async ensureCCTransferPreapproval(): Promise<void> {
-    if (await this.hasCCTransferPreapproval(this.adminPartyId)) {
+    if (await this.getCCTransferPreapprovalContractId(this.adminPartyId)) {
       console.log(`[Startup] CC TransferPreapproval already exists for admin party`);
       return;
     }
@@ -763,32 +764,40 @@ export class DamlService implements OnModuleInit {
       throw new Error(`Insufficient CC balance. Need ${amount}, have ${totalCC.toFixed(4)}`);
     }
 
-    console.log(`[Amulet Lock] Creating TransferOffer for ${amount} CC (total balance: ${totalCC.toFixed(4)} CC)`);
+    console.log(`[Amulet Lock] Locking ${amount} CC for ${partyId.split('::')[0]} (balance: ${totalCC.toFixed(4)} CC)`);
 
-    // Convert expiresAt to microseconds epoch for the wallet API
-    const expiresAtMicros = new Date(expiresAt).getTime() * 1000;
     const trackingId = `collateral-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
-    // Create a TransferOffer via the Validator Wallet API
-    // This locks the CC in an on-chain escrow (TransferOffer contract)
-    const result = await this.walletApiFetch('transfer-offers', 'POST', {
-      receiver_party_id: lockHolder,
-      amount: amount.toString(),
-      description: `Loan collateral: ${amount} CC locked until ${expiresAt}`,
-      expires_at: expiresAtMicros,
-      tracking_id: trackingId,
-    }, userToken);
+    // Check if admin (receiver) has a CC TransferPreapproval.
+    // If so, use the direct preapproval transfer — atomic, no separate accept needed.
+    // Otherwise fall back to TransferOffer + explicit accept.
+    const adminPreapprovalCid = await this.getCCTransferPreapprovalContractId(this.adminPartyId);
 
-    const offerContractId = result.offer_contract_id;
-    console.log(`[Amulet Lock] Created TransferOffer ${offerContractId} (tracking: ${trackingId})`);
-
-    // Accept the TransferOffer so CC moves into admin escrow.
-    // Skip if admin has CC TransferPreapproval — the transfer auto-completed on creation.
-    const adminHasPreapproval = await this.hasCCTransferPreapproval(this.adminPartyId);
-    if (adminHasPreapproval) {
-      console.log(`[Amulet Lock] Admin has CC TransferPreapproval — collateral auto-accepted`);
+    let offerContractId: string;
+    if (adminPreapprovalCid) {
+      console.log(`[Amulet Lock] Using CC TransferPreapproval for direct transfer to admin`);
+      const result = await this.walletApiFetch('transfer-preapproval/send', 'POST', {
+        transfer_preapproval_contract_id: adminPreapprovalCid,
+        receiver_party_id: lockHolder,
+        amount: amount.toString(),
+        description: `Loan collateral: ${amount} CC locked until ${expiresAt}`,
+        tracking_id: trackingId,
+        deduplication_id: trackingId,
+      }, userToken);
+      // Direct preapproval transfer has no offer contract ID — use tracking ID as reference
+      offerContractId = result.transaction_id ?? trackingId;
+      console.log(`[Amulet Lock] CC collateral transferred directly to admin (tracking: ${trackingId})`);
     } else {
-      console.log(`[Amulet Lock] Auto-accepting collateral into admin escrow...`);
+      const expiresAtMicros = new Date(expiresAt).getTime() * 1000;
+      const result = await this.walletApiFetch('transfer-offers', 'POST', {
+        receiver_party_id: lockHolder,
+        amount: amount.toString(),
+        description: `Loan collateral: ${amount} CC locked until ${expiresAt}`,
+        expires_at: expiresAtMicros,
+        tracking_id: trackingId,
+      }, userToken);
+      offerContractId = result.offer_contract_id;
+      console.log(`[Amulet Lock] Created TransferOffer ${offerContractId}, auto-accepting into admin escrow...`);
       await this.walletApiFetch(`transfer-offers/${offerContractId}/accept`, 'POST', {});
       console.log(`[Amulet Lock] CC collateral is now held in admin escrow`);
     }
@@ -798,34 +807,41 @@ export class DamlService implements OnModuleInit {
 
   /**
    * Return CC collateral from admin escrow to a recipient (borrower on repay, lender on default).
-   * Creates a new TransferOffer from admin → recipient and auto-accepts using their token.
+   * Uses direct preapproval transfer if recipient has CC TransferPreapproval, otherwise TransferOffer + accept.
    */
   async returnCCCollateral(recipientPartyId: string, amount: number, recipientUserToken?: string): Promise<void> {
-    console.log(`[Amulet Return] Sending ${amount} CC from admin escrow to ${recipientPartyId}`);
+    console.log(`[Amulet Return] Sending ${amount} CC from admin escrow to ${recipientPartyId.split('::')[0]}`);
 
-    const expiresAt = new Date(Date.now() + 24 * 60 * 60 * 1000); // 24h window to accept
-    const expiresAtMicros = expiresAt.getTime() * 1000;
     const trackingId = `collateral-return-${Date.now()}`;
 
-    // Create TransferOffer from admin (no userToken = uses admin M2M wallet)
-    const result = await this.walletApiFetch('transfer-offers', 'POST', {
-      receiver_party_id: recipientPartyId,
-      amount: amount.toString(),
-      description: `Collateral return: ${amount} CC`,
-      expires_at: expiresAtMicros,
-      tracking_id: trackingId,
-    });
+    // Check if recipient has a CC TransferPreapproval.
+    // If so, use the direct preapproval transfer — atomic, no separate accept needed.
+    const recipientPreapprovalCid = await this.getCCTransferPreapprovalContractId(recipientPartyId);
 
-    const offerContractId = result.offer_contract_id;
-    console.log(`[Amulet Return] TransferOffer ${offerContractId} created`);
-
-    // Skip accept if recipient has CC TransferPreapproval — the transfer auto-completed on creation.
-    const recipientHasPreapproval = await this.hasCCTransferPreapproval(recipientPartyId);
-    if (recipientHasPreapproval) {
-      console.log(`[Amulet Return] Recipient has CC TransferPreapproval — collateral auto-accepted`);
+    if (recipientPreapprovalCid) {
+      console.log(`[Amulet Return] Using CC TransferPreapproval for direct transfer to recipient`);
+      await this.walletApiFetch('transfer-preapproval/send', 'POST', {
+        transfer_preapproval_contract_id: recipientPreapprovalCid,
+        receiver_party_id: recipientPartyId,
+        amount: amount.toString(),
+        description: `Collateral return: ${amount} CC`,
+        tracking_id: trackingId,
+        deduplication_id: trackingId,
+      });
+      console.log(`[Amulet Return] CC collateral transferred directly to ${recipientPartyId.split('::')[0]}`);
     } else {
+      const expiresAtMicros = (Date.now() + 24 * 60 * 60 * 1000) * 1000;
+      const result = await this.walletApiFetch('transfer-offers', 'POST', {
+        receiver_party_id: recipientPartyId,
+        amount: amount.toString(),
+        description: `Collateral return: ${amount} CC`,
+        expires_at: expiresAtMicros,
+        tracking_id: trackingId,
+      });
+      const offerContractId = result.offer_contract_id;
+      console.log(`[Amulet Return] TransferOffer ${offerContractId} created, auto-accepting for recipient`);
       await this.walletApiFetch(`transfer-offers/${offerContractId}/accept`, 'POST', {}, recipientUserToken);
-      console.log(`[Amulet Return] CC collateral successfully returned to ${recipientPartyId}`);
+      console.log(`[Amulet Return] CC collateral successfully returned to ${recipientPartyId.split('::')[0]}`);
     }
   }
 
