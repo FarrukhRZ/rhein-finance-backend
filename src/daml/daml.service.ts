@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, OnModuleInit } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import * as http from 'http';
 import * as https from 'https';
@@ -13,7 +13,7 @@ import {
 } from './interfaces';
 
 @Injectable()
-export class DamlService {
+export class DamlService implements OnModuleInit {
   private readonly jsonApiUrl: string;
   private readonly packageId: string;
   private readonly adminPartyId: string;
@@ -35,6 +35,8 @@ export class DamlService {
   private readonly feePartyId: string;
   private readonly escrowPartyId: string;
   private readonly providerPartyId: string;
+  private readonly usdcxRegistryAppPackageId: string;
+  private readonly usdcxHoldingPackageId: string;
 
   // Cached Auth0 tokens (keyed by audience)
   private tokenCache: Map<string, { token: string; expiresAt: number }> = new Map();
@@ -65,6 +67,42 @@ export class DamlService {
     this.feePartyId = this.configService.get('FEE_PARTY_ID') || this.adminPartyId;
     this.escrowPartyId = this.configService.get('ESCROW_PARTY_ID') || this.adminPartyId;
     this.providerPartyId = this.configService.get('PROVIDER_PARTY_ID') || this.adminPartyId;
+    this.usdcxRegistryAppPackageId = this.configService.get('USDCX_REGISTRY_APP_PACKAGE_ID') || '661151768d69141dfd6b757bdc348012b2a64b2c956ad586782f97d07408f264';
+    this.usdcxHoldingPackageId = this.configService.get('USDCX_HOLDING_PACKAGE_ID') || 'dd3a9f2d51cc4c52d9ec2e1d7ff235298dcfb3afd1d50ab44328b1aaa9a18587';
+  }
+
+  async onModuleInit() {
+    // Ensure rhein-fees has a TransferPreapproval so incoming USDCx fee transfers
+    // auto-complete without a separate TransferInstruction_Accept step.
+    try {
+      await this.ensureTransferPreapproval(this.feePartyId);
+    } catch (err) {
+      console.warn(`[Startup] Failed to ensure TransferPreapproval for fee party: ${err}`);
+    }
+  }
+
+  private async hasTransferPreapproval(partyId: string): Promise<boolean> {
+    const template = `${this.usdcxRegistryAppPackageId}:Utility.Registry.App.V0.Model.TransferPreapproval:TransferPreapproval`;
+    const existing = await this.queryContracts([template], [partyId]);
+    return existing.some((c: any) => c.payload?.receiver === partyId);
+  }
+
+  private async ensureTransferPreapproval(partyId: string): Promise<void> {
+    const template = `${this.usdcxRegistryAppPackageId}:Utility.Registry.App.V0.Model.TransferPreapproval:TransferPreapproval`;
+    if (await this.hasTransferPreapproval(partyId)) {
+      console.log(`[Startup] TransferPreapproval already exists for ${partyId.split('::')[0]}`);
+      return;
+    }
+    await this.submitCommand(
+      [this.createCmd(template, {
+        operator: this.usdcxUtilityOperatorPartyId,
+        receiver: partyId,
+        instrumentAdmin: this.usdcxAdminPartyId,
+        instrumentAllowances: [],
+      })],
+      [partyId],
+    );
+    console.log(`[Startup] TransferPreapproval created for ${partyId.split('::')[0]}`);
   }
 
   // ============================================================================
@@ -921,10 +959,15 @@ export class DamlService {
       disbursementResult = await this.transferUSDCx(lenderPartyId, borrowerPartyId, borrowerAmount, senderToken);
       console.log(`[USDCx] Disbursement transfer instruction created successfully`);
 
-      // Auto-accept the TransferOffer on behalf of the borrower
+      // Auto-accept disbursement on behalf of the borrower (skip if pre-approval is set up)
       if (disbursementResult?.transferOfferContractId) {
         try {
-          await this.acceptUSDCxTransfer(disbursementResult.transferOfferContractId, borrowerPartyId);
+          const borrowerHasPreapproval = await this.hasTransferPreapproval(borrowerPartyId);
+          if (!borrowerHasPreapproval) {
+            await this.acceptUSDCxTransfer(disbursementResult.transferOfferContractId, borrowerPartyId);
+          } else {
+            console.log(`[USDCx] Borrower has TransferPreapproval — disbursement auto-completed`);
+          }
         } catch (acceptErr: any) {
           console.error(`[USDCx] Auto-accept failed (borrower must accept manually): ${acceptErr?.message}`);
         }
@@ -940,10 +983,8 @@ export class DamlService {
       if (fee > 0) {
         try {
           console.log(`[Fee] Collecting ${fee} USDCx protocol fee from lender to provider`);
-          const feeResult = await this.transferUSDCx(lenderPartyId, this.feePartyId, fee, senderToken);
-          if (feeResult?.transferOfferContractId) {
-            await this.acceptUSDCxTransfer(feeResult.transferOfferContractId, this.feePartyId);
-          }
+          await this.transferUSDCx(lenderPartyId, this.feePartyId, fee, senderToken);
+          // No acceptUSDCxTransfer needed — rhein-fees has TransferPreapproval set up
           console.log(`[Fee] Protocol fee collected successfully`);
         } catch (feeErr: any) {
           console.error(`[Fee] Failed to collect protocol fee: ${feeErr?.message}`);
@@ -1014,14 +1055,19 @@ export class DamlService {
     const transferResult = await this.transferUSDCx(partyId, lender, repaymentAmount, userToken);
     console.log(`[USDCx] Repayment transfer created, auto-accepting on behalf of lender`);
 
-    // Step 2: Auto-accept on behalf of the lender
+    // Step 2: Auto-accept on behalf of the lender (skip if pre-approval is set up)
     if (transferResult?.transferOfferContractId) {
-      try {
-        await this.acceptUSDCxTransfer(transferResult.transferOfferContractId, lender);
-        console.log(`[USDCx] Lender accepted repayment transfer`);
-      } catch (acceptErr: any) {
-        console.error(`[USDCx] Auto-accept for lender failed: ${acceptErr?.message}`);
-        throw new Error(`USDCx repayment transfer failed: ${acceptErr?.message}`);
+      const lenderHasPreapproval = await this.hasTransferPreapproval(lender);
+      if (!lenderHasPreapproval) {
+        try {
+          await this.acceptUSDCxTransfer(transferResult.transferOfferContractId, lender);
+          console.log(`[USDCx] Lender accepted repayment transfer`);
+        } catch (acceptErr: any) {
+          console.error(`[USDCx] Auto-accept for lender failed: ${acceptErr?.message}`);
+          throw new Error(`USDCx repayment transfer failed: ${acceptErr?.message}`);
+        }
+      } else {
+        console.log(`[USDCx] Lender has TransferPreapproval — repayment auto-completed`);
       }
     }
 
@@ -1447,7 +1493,7 @@ export class DamlService {
    * Uses the Utility.Registry.Holding.V0.Holding template from the CUB utilities DAR.
    */
   async getUSDCxHoldings(partyId: string): Promise<any[]> {
-    const holdingTemplateId = 'dd3a9f2d51cc4c52d9ec2e1d7ff235298dcfb3afd1d50ab44328b1aaa9a18587:Utility.Registry.Holding.V0.Holding:Holding';
+    const holdingTemplateId = `${this.usdcxHoldingPackageId}:Utility.Registry.Holding.V0.Holding:Holding`;
     try {
       const contracts = await this.queryContracts([holdingTemplateId], [partyId]);
       return contracts.filter(
