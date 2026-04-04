@@ -72,12 +72,20 @@ export class DamlService implements OnModuleInit {
   }
 
   async onModuleInit() {
-    // Ensure rhein-fees has a TransferPreapproval so incoming USDCx fee transfers
+    // Ensure rhein-fees has a USDCx TransferPreapproval so incoming fee transfers
     // auto-complete without a separate TransferInstruction_Accept step.
     try {
       await this.ensureTransferPreapproval(this.feePartyId);
     } catch (err) {
-      console.warn(`[Startup] Failed to ensure TransferPreapproval for fee party: ${err}`);
+      console.warn(`[Startup] Failed to ensure USDCx TransferPreapproval for fee party: ${err}`);
+    }
+
+    // Ensure admin party has a CC TransferPreapproval so borrower collateral lock
+    // transfers auto-complete without a separate /accept call.
+    try {
+      await this.ensureCCTransferPreapproval();
+    } catch (err) {
+      console.warn(`[Startup] Failed to ensure CC TransferPreapproval for admin party: ${err}`);
     }
   }
 
@@ -103,6 +111,23 @@ export class DamlService implements OnModuleInit {
       [partyId],
     );
     console.log(`[Startup] TransferPreapproval created for ${partyId.split('::')[0]}`);
+  }
+
+  private async hasCCTransferPreapproval(partyId: string): Promise<boolean> {
+    const template = `${this.amuletPackageId}:Splice.AmuletRules:TransferPreapproval`;
+    const existing = await this.queryContracts([template], [partyId]);
+    return existing.some((c: any) => c.payload?.receiver === partyId);
+  }
+
+  private async ensureCCTransferPreapproval(): Promise<void> {
+    if (await this.hasCCTransferPreapproval(this.adminPartyId)) {
+      console.log(`[Startup] CC TransferPreapproval already exists for admin party`);
+      return;
+    }
+    // Validator Wallet API creates the on-chain TransferPreapproval for the token holder of the M2M token.
+    // Admin M2M token = admin party → pre-approval is created for admin.
+    await this.walletApiFetch('transfer-preapproval', 'POST', {});
+    console.log(`[Startup] CC TransferPreapproval created for admin party`);
   }
 
   // ============================================================================
@@ -757,11 +782,16 @@ export class DamlService implements OnModuleInit {
     const offerContractId = result.offer_contract_id;
     console.log(`[Amulet Lock] Created TransferOffer ${offerContractId} (tracking: ${trackingId})`);
 
-    // Immediately accept the TransferOffer using admin M2M token so CC moves into admin escrow.
-    // This prevents the borrower from withdrawing the collateral after the loan is created.
-    console.log(`[Amulet Lock] Auto-accepting collateral into admin escrow...`);
-    await this.walletApiFetch(`transfer-offers/${offerContractId}/accept`, 'POST', {});
-    console.log(`[Amulet Lock] CC collateral is now held in admin escrow`);
+    // Accept the TransferOffer so CC moves into admin escrow.
+    // Skip if admin has CC TransferPreapproval — the transfer auto-completed on creation.
+    const adminHasPreapproval = await this.hasCCTransferPreapproval(this.adminPartyId);
+    if (adminHasPreapproval) {
+      console.log(`[Amulet Lock] Admin has CC TransferPreapproval — collateral auto-accepted`);
+    } else {
+      console.log(`[Amulet Lock] Auto-accepting collateral into admin escrow...`);
+      await this.walletApiFetch(`transfer-offers/${offerContractId}/accept`, 'POST', {});
+      console.log(`[Amulet Lock] CC collateral is now held in admin escrow`);
+    }
 
     return offerContractId;
   }
@@ -787,11 +817,16 @@ export class DamlService implements OnModuleInit {
     });
 
     const offerContractId = result.offer_contract_id;
-    console.log(`[Amulet Return] TransferOffer ${offerContractId} created, auto-accepting for recipient`);
+    console.log(`[Amulet Return] TransferOffer ${offerContractId} created`);
 
-    // Auto-accept on behalf of the recipient
-    await this.walletApiFetch(`transfer-offers/${offerContractId}/accept`, 'POST', {}, recipientUserToken);
-    console.log(`[Amulet Return] CC collateral successfully returned to ${recipientPartyId}`);
+    // Skip accept if recipient has CC TransferPreapproval — the transfer auto-completed on creation.
+    const recipientHasPreapproval = await this.hasCCTransferPreapproval(recipientPartyId);
+    if (recipientHasPreapproval) {
+      console.log(`[Amulet Return] Recipient has CC TransferPreapproval — collateral auto-accepted`);
+    } else {
+      await this.walletApiFetch(`transfer-offers/${offerContractId}/accept`, 'POST', {}, recipientUserToken);
+      console.log(`[Amulet Return] CC collateral successfully returned to ${recipientPartyId}`);
+    }
   }
 
   // ============================================================================
