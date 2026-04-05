@@ -83,6 +83,8 @@ NestJS Backend  ──── Canton JSON API v2 ──── Canton Ledger (DAML
 | `USDCX_ADMIN_PARTY_ID` | USDCx registrar/admin party ID |
 | `USDCX_BRIDGE_OPERATOR_PARTY_ID` | Canton Universal Bridge operator party ID |
 | `USDCX_UTILITY_OPERATOR_PARTY_ID` | DA utility operator party ID |
+| `USDCX_REGISTRY_APP_PACKAGE_ID` | Package ID for `utility-registry-app-v0` (differs between testnet and mainnet) |
+| `USDCX_HOLDING_PACKAGE_ID` | Package ID for `Utility.Registry.Holding.V0.Holding` (differs between testnet and mainnet) |
 | `CC_PRICE` | Fixed CC/USD price used for LTV calculation (e.g. `0.125`) |
 | `DEFAULT_LTV` | Default loan-to-value ratio (e.g. `0.50`) |
 
@@ -162,39 +164,36 @@ All endpoints are prefixed `/api`. JWT bearer token required unless noted.
 ### BorrowerBid (borrower initiates)
 
 1. Borrower calls `POST /offers` with `offerType: BorrowerBid`.
-2. Backend locks CC collateral via Validator Wallet API (`TransferOffer` → admin escrow).
-3. DAML `LoanOfferHybrid` contract is created; `RegisterOfferHybrid` marker is exercised. **(Marker 1)**
+2. Backend locks CC collateral: if admin has `CC TransferPreapproval`, uses `transfer-preapproval/send` (direct, atomic); otherwise creates `TransferOffer` + explicit accept into admin escrow.
+3. DAML `LoanOfferHybrid` + `RegisterOfferHybrid` marker created atomically via `CreateAndExercise`. **(Marker 1)**
 4. Lender calls `POST /offers/:id/accept`.
 5. Backend fetches offer from ledger (never trusts client payload), exercises `AcceptHybrid`. **(Marker 2)**
-6. Backend transfers USDCx from lender to borrower (`TransferFactory_Transfer` + auto-accept).
-7. `AcknowledgeDisbursementHybrid` marker exercised on the new `ActiveLoanHybrid`. **(Marker 3)**
-8. Protocol fee collected from lender in USDCx.
+6. Backend transfers USDCx from lender to borrower (`TransferFactory_Transfer`). If borrower has `USDCx TransferPreapproval`, auto-completes; otherwise backend calls `TransferInstruction_Accept`.
+7. Protocol fee collected from lender in USDCx. If `rhein-fees` has `USDCx TransferPreapproval`, auto-completes.
+8. `AcknowledgeDisbursementHybrid` + `RecordFeeCollectionHybrid` markers batched in a single Canton transaction. **(Markers 3 + 4)**
 
 ### LenderAsk (lender initiates)
 
 1. Lender calls `POST /offers` with `offerType: LenderAsk`.
-2. DAML `LoanOfferHybrid` created; `RegisterOfferHybrid` marker. **(Marker 1)**
+2. DAML `LoanOfferHybrid` + `RegisterOfferHybrid` marker created atomically via `CreateAndExercise`. **(Marker 1)**
 3. Borrower calls `POST /offers/:id/accept`.
-4. Backend locks CC collateral from borrower into admin escrow.
+4. Backend locks CC collateral from borrower into admin escrow (same preapproval logic as BorrowerBid step 2).
 5. Backend fetches offer from ledger, exercises `AcceptHybrid`. **(Marker 2)**
-6. Backend transfers USDCx from lender (admin acts on behalf) to borrower + auto-accepts.
-7. `AcknowledgeDisbursementHybrid` marker. **(Marker 3)**
-8. Protocol fee collected from lender.
+6. Backend transfers USDCx from lender to borrower + handles accept (same preapproval logic as BorrowerBid step 6).
+7. Protocol fee + markers same as BorrowerBid steps 7–8.
 
 ### Repayment
 
 1. Borrower calls `POST /loans/:id/repay` with `repaymentAmount`.
-2. Backend transfers USDCx from borrower to lender + auto-accepts.
-3. `RecordCollateralReturnHybrid` marker exercised (loan still active). **(Marker 4)**
-4. `RepayHybrid` exercised on `ActiveLoanHybrid` → creates `SettledLoan`. **(Marker 5)**
-5. CC collateral returned from admin escrow to borrower via Validator Wallet API.
+2. Backend transfers USDCx from borrower to lender. If lender has `USDCx TransferPreapproval`, auto-completes; otherwise backend calls `TransferInstruction_Accept`.
+3. `RecordCollateralReturnHybrid` + `RepayHybrid` exercised in a single batched Canton transaction → creates `SettledLoan`. **(Markers 5 + 6)**
+4. CC collateral returned from admin escrow to borrower: if borrower has `CC TransferPreapproval`, uses `transfer-preapproval/send`; otherwise `TransferOffer` + accept.
 
 ### Default Claim
 
 1. Lender calls `POST /loans/:id/default` after maturity.
-2. `RecordCollateralReturnHybrid` marker. **(Marker 4)**
-3. `ClaimDefaultHybrid` exercised → creates `DefaultedLoan`. **(Marker 5)**
-4. CC collateral sent from admin escrow to lender.
+2. `RecordCollateralReturnHybrid` + `ClaimDefaultHybrid` exercised in a single batched Canton transaction → creates `DefaultedLoan`. **(Markers 5 + 6)**
+3. CC collateral sent from admin escrow to lender (same preapproval logic as repayment step 4).
 
 ---
 
@@ -202,14 +201,14 @@ All endpoints are prefixed `/api`. JWT bearer token required unless noted.
 
 Every loan lifecycle generates **6 activity markers** via `FeaturedAppRight_CreateActivityMarker`:
 
-| # | Event | Choice |
-|---|-------|--------|
-| 1 | Offer created | `RegisterOfferHybrid` (batched with create via `CreateAndExercise`) |
-| 2 | Loan originated | `AcceptHybrid` |
-| 3 | USDCx disbursed | `AcknowledgeDisbursementHybrid` |
-| 4 | Protocol fee collected | `RecordFeeCollectionHybrid` |
-| 5 | Collateral returned | `RecordCollateralReturnHybrid` |
-| 6 | Loan settled / defaulted | `RepayHybrid` / `ClaimDefaultHybrid` |
+| # | Event | Choice | Canton tx |
+|---|-------|--------|-----------|
+| 1 | Offer created | `RegisterOfferHybrid` | Batched with `LoanOfferHybrid` create via `CreateAndExercise` |
+| 2 | Loan originated | `AcceptHybrid` | Acceptance tx |
+| 3 | USDCx disbursed | `AcknowledgeDisbursementHybrid` | Batched with marker 4 |
+| 4 | Protocol fee collected | `RecordFeeCollectionHybrid` | Batched with marker 3 |
+| 5 | Collateral returned | `RecordCollateralReturnHybrid` | Batched with marker 6 |
+| 6 | Loan settled / defaulted | `RepayHybrid` / `ClaimDefaultHybrid` | Batched with marker 5 |
 
 `provider` is a signatory on all DAML templates, ensuring Rhein Finance is a confirmer on every sub-transaction regardless of marker creation.
 
@@ -218,8 +217,11 @@ Every loan lifecycle generates **6 activity markers** via `FeaturedAppRight_Crea
 ## Key Design Decisions
 
 - **Offer data always fetched from ledger** — `acceptLoanOffer` ignores the client-supplied offer payload entirely and re-fetches from the DAML ACS. This prevents financial logic manipulation via forged request bodies.
-- **CC collateral held in admin escrow** — CC is transferred to the admin party on loan creation and returned to the borrower (or lender on default) on settlement. The `ccCollateralReference` field in `ActiveLoanHybrid` stores the original `TransferOffer` contract ID as an audit reference.
-- **USDCx via Canton Universal Bridge** — USDCx is a real token bridged from USDC. The backend uses the DA token-standard API (`TransferFactory_Transfer` + `TransferInstruction_Accept`) for all USDCx transfers.
+- **CC collateral held in admin escrow** — CC is transferred to the admin party on loan creation and returned to the borrower (or lender on default) on settlement. The `ccCollateralReference` field in `ActiveLoanHybrid` stores the original transfer audit reference (TransferOffer contract ID or transaction ID on the preapproval path).
+- **CC TransferPreapproval** — if the receiver has `Splice.AmuletRules:TransferPreapproval` on the ledger, CC transfers use `POST /wallet/transfer-preapproval/send` (direct, atomic) instead of the TransferOffer + accept pattern. Admin preapproval is auto-created on startup. Deterministic `deduplication_id` values (based on offer/loan contract IDs) prevent double-transfer on retry.
+- **USDCx TransferPreapproval** — if the receiver has `Utility.Registry.App.V0.Model.TransferPreapproval` on the ledger, `TransferFactory_Transfer` auto-completes without a separate `TransferInstruction_Accept` Canton transaction. `rhein-fees` preapproval is auto-created on startup.
+- **Canton transaction batching** — related DAML commands are batched into single Canton transactions (e.g. `CreateAndExercise` for offer creation, batched markers on acceptance and repayment) to reduce on-chain transaction count.
+- **USDCx via Canton Universal Bridge** — USDCx is a real token bridged from USDC. The backend uses the DA token-standard API (`TransferFactory_Transfer` + conditional `TransferInstruction_Accept`) for all USDCx transfers.
 - **Fixed CC price** — CC price is fixed at contract origination (`ccPrice` field in `ActiveLoanHybrid`) to prevent oracle manipulation during the loan lifetime.
 - **All DAML commands use admin M2M token** — the backend holds actAs rights for all user parties via `grantAdminActAs`, allowing it to submit commands on behalf of users without requiring the user's token for ledger operations.
 

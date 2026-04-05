@@ -21,7 +21,7 @@ The contracts implement a **hybrid collateral lending protocol**:
 |-------|-------|
 | DAML SDK | 3.4.9 |
 | Package name | `rhein-lending-v2` |
-| Package version | `0.5.0` |
+| Package version | `0.6.0` |
 | Target LF version | `2.1` |
 | Data dependency | `splice-api-featured-app-v1-1.0.0.dar` |
 
@@ -136,6 +136,7 @@ Represents a live loan. Created by `AcceptHybrid`. Archived by `RepayHybrid` or 
 | `RepayHybrid` | `provider`, `borrower`, `lender` | Yes | Confirm repayment → creates `SettledLoan`. Returns `ccCollateralReference`. Fires CIP-0104 marker. |
 | `ClaimDefaultHybrid` | `provider`, `lender` | Yes | Claim default after maturity → creates `DefaultedLoan`. Returns `ccCollateralReference`. Fires CIP-0104 marker. |
 | `AcknowledgeDisbursementHybrid` | `provider` | No | Fires CIP-0104 marker after USDCx disbursement. |
+| `RecordFeeCollectionHybrid` | `provider` | No | Fires CIP-0104 marker after protocol fee collection. |
 | `RecordCollateralReturnHybrid` | `provider` | No | Fires CIP-0104 marker before collateral is returned. |
 | `CalculateRepaymentHybrid` | `borrower` | No | Returns current repayment amount (principal + accrued interest). |
 | `CheckMaturityHybrid` | `borrower` | No | Returns whether the loan has matured. |
@@ -229,15 +230,16 @@ Final state — created by `ClaimDefaultHybrid`. Immutable record of a defaulted
 
 `provider` is a **signatory** on all four templates. This means Rhein Finance is a **confirmer** on every sub-transaction that touches these contracts — including third-party choices — regardless of whether a `FeaturedAppRight` marker is explicitly exercised.
 
-In addition, `FeaturedAppRight_CreateActivityMarker` is explicitly exercised at 5 lifecycle points:
+In addition, `FeaturedAppRight_CreateActivityMarker` is explicitly exercised at 6 lifecycle points:
 
 | # | Event | Choice | Template |
 |---|-------|--------|----------|
 | 1 | Offer registered | `RegisterOfferHybrid` | `LoanOfferHybrid` |
 | 2 | Loan originated | `AcceptHybrid` | `LoanOfferHybrid` |
 | 3 | USDCx disbursed | `AcknowledgeDisbursementHybrid` | `ActiveLoanHybrid` |
-| 4 | Collateral returned | `RecordCollateralReturnHybrid` | `ActiveLoanHybrid` |
-| 5 | Loan settled/defaulted | `RepayHybrid` / `ClaimDefaultHybrid` | `ActiveLoanHybrid` |
+| 4 | Protocol fee collected | `RecordFeeCollectionHybrid` | `ActiveLoanHybrid` |
+| 5 | Collateral returned | `RecordCollateralReturnHybrid` | `ActiveLoanHybrid` |
+| 6 | Loan settled/defaulted | `RepayHybrid` / `ClaimDefaultHybrid` | `ActiveLoanHybrid` |
 
 All marker choices accept `featuredAppRightCid : Optional (ContractId FeaturedAppRight)`. Passing `None` is valid — the marker step is skipped gracefully without failing the main transaction. The `Optional` type also satisfies Canton's upgrade compatibility requirements for new choice fields.
 
@@ -261,7 +263,7 @@ All marker choices accept `featuredAppRightCid : Optional (ContractId FeaturedAp
 daml build
 ```
 
-Outputs: `.daml/dist/rhein-lending-v2-0.5.0.dar`
+Outputs: `.daml/dist/rhein-lending-v2-0.6.0.dar`
 
 Requires:
 - Daml SDK 3.4.9 (`daml install 3.4.9`)
@@ -275,7 +277,7 @@ daml ledger upload-dar \
   --host <participant-host> \
   --port <ledger-api-port> \
   --access-token-file <token-file> \
-  .daml/dist/rhein-lending-v2-0.5.0.dar
+  .daml/dist/rhein-lending-v2-0.6.0.dar
 ```
 
 After upload, update `PACKAGE_ID` in the backend `.env` with the new package hash.
