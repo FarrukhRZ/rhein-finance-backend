@@ -1,9 +1,9 @@
 # Rhein Finance Backend — Security Audit Report
 
-**Date**: 2026-04-02  
-**Auditor**: Internal (pre-external-audit review)  
-**Scope**: NestJS backend (`/src`), DAML contracts (`rhein-contracts/daml`)  
-**Version**: Backend `main` branch @ `fdeaeff`, DAML contracts v0.5.0
+**Date**: 2026-04-02 (updated 2026-04-05)
+**Auditor**: Internal (pre-external-audit review)
+**Scope**: NestJS backend (`/src`), DAML contracts (`rhein-contracts/daml`)
+**Version**: Backend `main` branch @ `dcfcebf`, DAML contracts v0.6.0
 
 ---
 
@@ -11,9 +11,9 @@
 
 The Rhein Finance backend is a NestJS application that orchestrates a P2P lending protocol on the Canton Network. Authentication is handled via Auth0 (RS256 JWT), authorization via role-based guards, and financial logic is enforced on-chain through DAML smart contracts.
 
-Two critical vulnerabilities were identified that allow financial logic manipulation at the HTTP layer before DAML contract enforcement. Five high/medium issues were identified related to missing guards, unvalidated input, and information disclosure. These should be resolved before engaging an external auditor.
+Two critical vulnerabilities were identified that allow financial logic manipulation at the HTTP layer before DAML contract enforcement. Five high/medium issues were identified related to missing guards, unvalidated input, and information disclosure. All critical and high findings have been resolved. Post-audit improvements include Canton transaction batching, USDCx and CC TransferPreapproval support, and a new DAML activity marker.
 
-**Risk Rating: HIGH** — due to the two critical findings.
+**Risk Rating: MEDIUM** — all critical and high findings resolved; remaining items are low/informational.
 
 ---
 
@@ -21,21 +21,26 @@ Two critical vulnerabilities were identified that allow financial logic manipula
 
 | ID | Severity | Title | Status |
 |----|----------|-------|--------|
-| CRIT-1 | 🔴 Critical | Client-supplied offer payload used for financial logic | Open |
-| CRIT-2 | 🔴 Critical | `claimDate` override allows forcing default on non-matured loans | Open |
-| HIGH-1 | 🟠 High | Rate limiting module registered but guard never applied | Open |
-| HIGH-2 | 🟠 High | Explorer endpoints fully public — leaks all party transaction history | Open |
-| HIGH-3 | 🟠 High | `/admin/database/clear` has no confirmation safeguard | Open |
-| MED-1 | 🟡 Medium | `forbidNonWhitelisted: false` — unknown fields silently stripped | Open |
-| MED-2 | 🟡 Medium | Fee withdrawal recipient party ID has no format validation | Open |
-| MED-3 | 🟡 Medium | `AcceptOfferDto.offer` untyped — no structural validation | Open |
-| MED-4 | 🟡 Medium | `repaymentAmount` has no minimum value constraint | Open |
-| MED-5 | 🟡 Medium | Swagger UI publicly accessible in production | Open |
+| CRIT-1 | 🔴 Critical | Client-supplied offer payload used for financial logic | ✅ Fixed |
+| CRIT-2 | 🔴 Critical | `claimDate` override allows forcing default on non-matured loans | ✅ Fixed |
+| HIGH-1 | 🟠 High | Rate limiting module registered but guard never applied | ✅ Fixed |
+| HIGH-2 | 🟠 High | Explorer endpoints fully public — leaks all party transaction history | ✅ Fixed |
+| HIGH-3 | 🟠 High | `/admin/database/clear` has no confirmation safeguard | ✅ Fixed |
+| MED-1 | 🟡 Medium | `forbidNonWhitelisted: false` — unknown fields silently stripped | ✅ Fixed |
+| MED-2 | 🟡 Medium | Fee withdrawal recipient party ID has no format validation | ✅ Fixed |
+| MED-3 | 🟡 Medium | `AcceptOfferDto.offer` untyped — no structural validation | ✅ Fixed (superseded by CRIT-1 fix) |
+| MED-4 | 🟡 Medium | `repaymentAmount` has no minimum value constraint | ✅ Fixed |
+| MED-5 | 🟡 Medium | Swagger UI publicly accessible in production | ✅ Fixed |
 | MED-6 | 🟡 Medium | `synchronize` relies on `NODE_ENV` — footgun if unset in production | Open |
 | LOW-1 | 🔵 Low | Loan repayment ownership not verified at HTTP layer | Open |
 | LOW-2 | 🔵 Low | Raw internal errors leaked to HTTP responses | Open |
 | LOW-3 | 🔵 Low | No structured logging — verbose console output in production | Open |
 | LOW-4 | 🔵 Low | `ADMIN_KEY` defined in env but never consumed | Open |
+| PA-LOW-1 | 🔵 Low | Preapproval startup failures silently swallowed | Acknowledged |
+| PA-LOW-2 | 🔵 Low | `deduplication_id` was randomised — no retry protection | ✅ Fixed |
+| PA-INFO-1 | ℹ️ Info | `offerContractId` fallback to tracking string on preapproval path | ✅ Fixed (audit log clarified) |
+| PA-INFO-2 | ℹ️ Info | `RecordFeeCollectionHybrid` has no idempotency guard | Open (known, see below) |
+| PA-KI-1 | ⚠️ Known Issue | Multi-step flows are not atomic — partial failure risk | Open (planned) |
 
 ---
 
@@ -45,70 +50,40 @@ Two critical vulnerabilities were identified that allow financial logic manipula
 
 ### CRIT-1 — Client-Supplied Offer Payload Used for Financial Logic
 
-**Severity**: Critical  
-**File**: `src/loans/loans.controller.ts:60`, `src/loans/dto/accept-offer.dto.ts`
+**Severity**: Critical | **Status**: ✅ Fixed (`acceptLoanOffer` now fetches offer from ledger via `getLoanOfferByContractId` and ignores client payload for all financial logic)
 
 **Description**
 
-When a user accepts a loan offer, the frontend sends the full offer object in the request body (`AcceptOfferDto.offer`). The backend then uses fields from this client-supplied object — including `offer.payload.loanAmount`, `offer.payload.offerType`, and `offer.payload.initiator` — to determine:
+When a user accepts a loan offer, the frontend sends the full offer object in the request body (`AcceptOfferDto.offer`). The backend then used fields from this client-supplied object — including `offer.payload.loanAmount`, `offer.payload.offerType`, and `offer.payload.initiator` — to determine:
 
 - How much USDCx to disburse to the borrower
 - Whether the caller is acting as lender or borrower
 - Which party to collect fees from
 
-A malicious user can forge these values to manipulate disbursement amounts, swap lender/borrower roles, or avoid fee collection, all without touching the on-chain DAML contract.
+A malicious user could forge these values to manipulate disbursement amounts, swap lender/borrower roles, or avoid fee collection, all without touching the on-chain DAML contract.
 
-**Affected Code**
-
-```typescript
-// loans.controller.ts
-const result = await this.loansService.acceptOffer(contractId, user.partyId, dto.offer, user.rawToken);
-
-// daml.service.ts — uses dto.offer.payload.loanAmount for USDCx transfer amount
-const loanAmount = parseFloat(offer.payload.loanAmount);
-// uses dto.offer.payload.offerType to determine lender vs borrower
-if (offer.payload.offerType === 'BorrowerBid') { ... } else { ... }
-```
-
-**Recommendation**
-
-Never trust client-supplied financial data. Fetch the offer directly from the DAML ledger by `contractId` inside `acceptLoanOffer`, and derive all values from that authoritative source:
+**Fix Applied**
 
 ```typescript
-// Fetch from ledger, not from client
-const offers = await this.queryContracts([this.templateId('LoanOfferHybrid:LoanOfferHybrid')], [partyId]);
-const offer = offers.find(o => o.contractId === offerContractId);
-if (!offer) throw new NotFoundException('Offer not found on ledger');
+// SECURITY: Always fetch offer from the ledger — never trust the client-supplied payload
+const offer = await this.getLoanOfferByContractId(offerContractId);
+if (!offer) throw new Error(`Offer ${offerContractId} not found on ledger`);
+if (offer.payload.initiator === partyId) throw new Error('Cannot accept your own loan offer');
 ```
 
 ---
 
 ### CRIT-2 — `claimDate` Override Allows Forcing Default on Non-Matured Loans
 
-**Severity**: Critical  
-**File**: `src/loans/dto/default-loan.dto.ts`, `src/loans/loans.controller.ts:104`
+**Severity**: Critical | **Status**: ✅ Fixed (`claimDate` now restricted to `admin` role)
 
 **Description**
 
-The `DefaultLoanDto` exposes an optional `claimDate` field that overrides the current date in the default-claim flow. It has only `@IsString() @IsOptional()` validation — no date format check, no constraint that the date must be today or in the past, and no admin-only restriction.
+The `DefaultLoanDto` exposed an optional `claimDate` field that overrode the current date in the default-claim flow. Any authenticated user who knew a loan's `contractId` could pass a future date to satisfy the DAML contract's `claimDate >= maturityDate` check, forcing a default on a non-matured loan.
 
-Any authenticated user who knows a loan's `contractId` can pass a future date to override the maturity check in the DAML contract, forcing a default on a loan that hasn't yet matured. The DAML contract enforces `claimDate >= maturityDate`, so an attacker would pass a date far enough in the future to satisfy that check.
-
-**Affected Code**
+**Fix Applied**
 
 ```typescript
-// default-loan.dto.ts
-@IsString()
-@IsOptional()
-claimDate?: string;  // No max date, no format validation
-```
-
-**Recommendation**
-
-Remove `claimDate` from the DTO entirely for production. It was added for testing. If admin override is needed, restrict it to the `admin` role:
-
-```typescript
-// Only allow override if caller is admin
 if (dto.claimDate && user.role !== 'admin') {
   throw new ForbiddenException('claimDate override requires admin role');
 }
@@ -118,227 +93,65 @@ if (dto.claimDate && user.role !== 'admin') {
 
 ### HIGH-1 — Rate Limiting Module Registered but Guard Never Applied
 
-**Severity**: High  
-**File**: `src/app.module.ts:42`
-
-**Description**
-
-`ThrottlerModule` is imported and configured (100 requests/min) but `ThrottlerGuard` is never added to the global `APP_GUARD` providers. Rate limiting is completely inactive across all endpoints, including high-value ones that trigger on-chain transactions (`POST /offers`, `POST /offers/:id/accept`, `POST /loans/:id/repay`).
-
-**Affected Code**
-
-```typescript
-// app.module.ts — ThrottlerModule configured but guard missing
-ThrottlerModule.forRoot([{ ttl: 60000, limit: 100 }]),
-
-providers: [
-  { provide: APP_GUARD, useClass: JwtAuthGuard },
-  { provide: APP_GUARD, useClass: RolesGuard },
-  // ThrottlerGuard missing
-],
-```
-
-**Recommendation**
-
-```typescript
-import { ThrottlerGuard } from '@nestjs/throttler';
-
-providers: [
-  { provide: APP_GUARD, useClass: ThrottlerGuard },
-  { provide: APP_GUARD, useClass: JwtAuthGuard },
-  { provide: APP_GUARD, useClass: RolesGuard },
-],
-```
-
-Consider applying stricter limits to the loan/offer endpoints specifically using `@Throttle()`.
+**Severity**: High | **Status**: ✅ Fixed (`ThrottlerGuard` added to global `APP_GUARD` providers)
 
 ---
 
-### HIGH-2 — Explorer Endpoints Fully Public, Leaks All Party Transaction History
+### HIGH-2 — Explorer Endpoints Fully Public
 
-**Severity**: High  
-**File**: `src/explorer/explorer.controller.ts:8`
-
-**Description**
-
-The entire `ExplorerController` is decorated with `@Public()`, bypassing JWT authentication. Any unauthenticated caller can query:
-
-- Full transaction history for any party ID (`GET /explorer/transactions?partyId=...`)
-- Any individual transaction by ID
-- Complete contract lifecycle history for any contract ID
-
-This leaks financial activity (loan amounts, counterparties, repayment history) for all platform users.
-
-**Recommendation**
-
-Remove `@Public()` from the controller. Require authentication and restrict `partyId` query parameter to the requesting user's own `partyId` (unless admin):
-
-```typescript
-async getTransactions(@CurrentUser() user: User, @Query('partyId') partyId?: string) {
-  const effectivePartyId = user.role === 'admin' ? (partyId || user.partyId) : user.partyId;
-  // ...
-}
-```
+**Severity**: High | **Status**: ✅ Fixed (`@Public()` removed; endpoints require authentication and restrict `partyId` to requesting user unless admin)
 
 ---
 
 ### HIGH-3 — `/admin/database/clear` Has No Confirmation Safeguard
 
-**Severity**: High  
-**File**: `src/admin/admin.controller.ts:157`, `src/admin/admin.service.ts:398`
-
-**Description**
-
-`POST /api/admin/database/clear` deletes all parties and deposits with no confirmation token, no dry-run mode, and no audit log. A single compromised admin account results in irreversible data loss. The endpoint is protected by the `admin` role, but that is the only safeguard.
-
-**Recommendation**
-
-Require an explicit confirmation string in the request body, and log the action before executing:
-
-```typescript
-async clearDatabase(@Body() body: { confirm: string }) {
-  if (body.confirm !== 'DELETE_ALL_DATA') {
-    throw new BadRequestException('Must pass { "confirm": "DELETE_ALL_DATA" }');
-  }
-  console.error(`[AUDIT] Database cleared by admin at ${new Date().toISOString()}`);
-  // proceed
-}
-```
+**Severity**: High | **Status**: ✅ Fixed (confirmation string required; action logged before execution)
 
 ---
 
-### MED-1 — `forbidNonWhitelisted: false` — Unknown Fields Silently Stripped
+### MED-1 — `forbidNonWhitelisted: false`
 
-**Severity**: Medium  
-**File**: `src/main.ts:33`
-
-**Description**
-
-`ValidationPipe` is configured with `whitelist: true` (unknown fields are stripped) but `forbidNonWhitelisted: false` (no error is thrown). Unexpected fields pass through silently. Combined with DTOs typed as `any`, this reduces the effectiveness of input validation.
-
-**Recommendation**
-
-```typescript
-new ValidationPipe({
-  whitelist: true,
-  forbidNonWhitelisted: true,  // Return 400 on unexpected fields
-  transform: true,
-})
-```
+**Severity**: Medium | **Status**: ✅ Fixed (`forbidNonWhitelisted: true` set in `ValidationPipe`)
 
 ---
 
 ### MED-2 — Fee Withdrawal Recipient Party ID Has No Format Validation
 
-**Severity**: Medium  
-**File**: `src/admin/dto/withdraw-fees.dto.ts`
-
-**Description**
-
-`WithdrawFeesDto.recipientPartyId` is validated only as `@IsString()`. Any arbitrary string is accepted, including malformed party IDs that will fail at the DAML layer with an opaque error.
-
-**Recommendation**
-
-```typescript
-@Matches(/^[A-Za-z0-9_-]+::1220[a-f0-9]{64}$/, {
-  message: 'Invalid party ID format',
-})
-recipientPartyId: string;
-```
+**Severity**: Medium | **Status**: ✅ Fixed (regex pattern `@Matches(/^[A-Za-z0-9_-]+::1220[a-f0-9]{64}$/)` applied)
 
 ---
 
-### MED-3 — `AcceptOfferDto.offer` Is Untyped With No Structural Validation
+### MED-3 — `AcceptOfferDto.offer` Untyped
 
-**Severity**: Medium  
-**File**: `src/loans/dto/accept-offer.dto.ts`
-
-**Description**
-
-`offer` is typed as `any` with only `@IsObject()`. If the payload is missing expected fields (e.g. `offer.payload.initiator`), the service throws a null dereference deep in the call stack, returning a 500 instead of a clean 400.
-
-This is secondary to CRIT-1 — once the offer is fetched from the ledger instead of the client, this DTO becomes irrelevant for financial logic.
-
-**Recommendation**
-
-Define a typed nested DTO class for the offer structure with proper validators, or eliminate the field entirely once CRIT-1 is fixed.
+**Severity**: Medium | **Status**: ✅ Fixed (superseded by CRIT-1 fix — offer is fetched from ledger, client payload is ignored for financial logic)
 
 ---
 
 ### MED-4 — `repaymentAmount` Has No Minimum Value
 
-**Severity**: Medium  
-**File**: `src/loans/dto/repay-loan.dto.ts`
-
-**Description**
-
-`@IsNumber()` with no `@Min(...)` allows zero or negative repayment amounts. The USDCx transfer would be attempted before the DAML contract rejects it.
-
-**Recommendation**
-
-```typescript
-@Min(0.000001, { message: 'repaymentAmount must be positive' })
-repaymentAmount: number;
-```
+**Severity**: Medium | **Status**: ✅ Fixed (`@Min(0.000001)` added to `RepayLoanDto`)
 
 ---
 
 ### MED-5 — Swagger UI Publicly Accessible in Production
 
-**Severity**: Medium  
-**File**: `src/main.ts:72`
-
-**Description**
-
-`/api/docs` is exposed with no authentication and no environment guard. It documents every endpoint, parameter, schema, and example value — lowering the bar for API reconnaissance.
-
-**Recommendation**
-
-```typescript
-if (configService.get('NODE_ENV') !== 'production') {
-  SwaggerModule.setup('api/docs', app, document);
-}
-```
+**Severity**: Medium | **Status**: ✅ Fixed (Swagger only mounted when `NODE_ENV !== 'production'`)
 
 ---
 
 ### MED-6 — TypeORM `synchronize` Depends on `NODE_ENV` Being Set
 
-**Severity**: Medium  
-**File**: `src/app.module.ts:35`
+**Severity**: Medium | **Status**: Open
 
-**Description**
-
-```typescript
-synchronize: configService.get('NODE_ENV') === 'development'
-```
-
-If `NODE_ENV` is not set in production, this evaluates to `false` — safe. But this is implicit. A deployment that omits `NODE_ENV` could accidentally enable auto-sync, which can silently alter the production database schema.
-
-**Recommendation**
-
-Explicitly disable synchronize in all non-development environments:
-
-```typescript
-synchronize: configService.get('NODE_ENV') === 'development' && configService.get('DB_SYNC') === 'true',
-```
-
-Use TypeORM migrations for production schema changes.
+If `NODE_ENV` is not set in production, `synchronize: configService.get('NODE_ENV') === 'development'` evaluates to `false` — safe by accident. A deployment that omits `NODE_ENV` could accidentally enable auto-sync. Use TypeORM migrations for production schema changes.
 
 ---
 
 ### LOW-1 — Loan Repayment Ownership Not Verified at HTTP Layer
 
-**Severity**: Low  
-**File**: `src/loans/loans.controller.ts:80`
+**Severity**: Low | **Status**: Open
 
-**Description**
-
-`POST /loans/:contractId/repay` does not verify that the calling user is the borrower of the loan before proceeding. The DAML contract will reject unauthorized repayment (since `provider, borrower, lender` are all required signatories on `RepayHybrid`), but the USDCx transfer is initiated first, potentially creating a locked holding before the DAML step fails.
-
-**Recommendation**
-
-Add a borrower check before initiating the transfer:
+`POST /loans/:contractId/repay` does not verify the calling user is the borrower before initiating the USDCx transfer. The DAML contract rejects unauthorized repayment, but the transfer is attempted first. Add a borrower check before the transfer:
 
 ```typescript
 if (loan.payload.borrower !== partyId) {
@@ -350,46 +163,99 @@ if (loan.payload.borrower !== partyId) {
 
 ### LOW-2 — Raw Internal Errors Leaked to HTTP Responses
 
-**Severity**: Low  
-**File**: `src/daml/daml.service.ts` (multiple locations)
+**Severity**: Low | **Status**: Open
 
-**Description**
-
-Internal errors from the Canton JSON API, DA utility backend, and wallet API are thrown directly as `Error` objects with their full message strings, which propagate to the HTTP response. These messages may contain party IDs, contract IDs, ledger offset values, and stack traces.
-
-**Recommendation**
-
-Implement a NestJS exception filter that maps internal errors to generic user-facing messages, logging the full detail server-side only.
+Internal errors from the Canton JSON API, DA utility backend, and wallet API propagate to HTTP responses with full message strings (party IDs, contract IDs, ledger offsets). Implement a NestJS exception filter mapping internal errors to generic user-facing messages.
 
 ---
 
 ### LOW-3 — No Structured Logging in Production
 
-**Severity**: Low  
-**File**: Throughout `src/daml/daml.service.ts`, `src/admin/admin.service.ts`
+**Severity**: Low | **Status**: Open
 
-**Description**
-
-All logging uses `console.log`/`console.error`. In production this produces unstructured output, making log aggregation, alerting, and incident response difficult. Auth0 token fetches, DAML command submissions, and USDCx transfers all produce log lines that are not queryable.
-
-**Recommendation**
-
-Integrate a structured logger (NestJS built-in Logger, Winston, or Pino) with log levels (`debug`, `info`, `warn`, `error`) and JSON output format.
+All logging uses `console.log`/`console.error`. Integrate a structured logger (NestJS Logger, Winston, or Pino) with log levels and JSON output for production observability.
 
 ---
 
 ### LOW-4 — `ADMIN_KEY` Defined in Environment But Never Consumed
 
-**Severity**: Low  
-**File**: `.env`
+**Severity**: Low | **Status**: Open
 
-**Description**
+`ADMIN_KEY=change-me-in-production` is present in env but never read. Admin access is handled via Auth0 role claims. Remove to avoid confusion.
 
-`ADMIN_KEY=change-me-in-production` is present in the environment configuration but is never read by the application. Admin access is correctly handled via Auth0 role claims. The dangling variable is misleading and the placeholder value could cause confusion.
+---
 
-**Recommendation**
+## Post-Audit Findings (PA series)
 
-Remove `ADMIN_KEY` from `.env` and any `.env.example` files to avoid confusion.
+These findings were identified during a follow-up review of post-audit changes.
+
+---
+
+### PA-LOW-1 — Preapproval Startup Failures Silently Swallowed
+
+**Severity**: Low | **Status**: Acknowledged
+
+`onModuleInit` catches and warns on preapproval creation failures. If USDCx or CC TransferPreapproval creation fails at startup, the system silently falls back to explicit accepts — which may fail at runtime with no obvious root cause. Not a security issue but a reliability risk. Planned improvement: add startup health check that surfaces preapproval state.
+
+---
+
+### PA-LOW-2 — `deduplication_id` Was Randomised on CC Preapproval Transfers
+
+**Severity**: Low | **Status**: ✅ Fixed
+
+`transfer-preapproval/send` was called with a random `deduplication_id`, providing no retry protection. A network failure causing a retry could result in double-collateral-lock or double-return.
+
+**Fix Applied**: `lockAmulet` now accepts an optional `deduplicationId` parameter. Callers pass deterministic values — the offer contract ID (LenderAsk accept) or a stable hash of `partyId + amount + maturityDate` (BorrowerBid offer). `returnCCCollateral` uses the loan contract ID as dedup anchor.
+
+---
+
+### PA-INFO-1 — `offerContractId` Fallback to Tracking String on Preapproval Path
+
+**Severity**: Informational | **Status**: ✅ Fixed (audit log clarified)
+
+When using `transfer-preapproval/send`, there is no offer contract ID. The result's `transaction_id` (or tracking string) was being stored as `lockedCCCollateral` / `ccCollateralReference`. Downstream code does not exercise choices on this value (it is an `Optional Text` audit field in DAML), but the ambiguity was confusing.
+
+**Fix Applied**: Logged explicitly as `audit ref` with a comment clarifying no downstream code exercises choices on this value.
+
+---
+
+### PA-INFO-2 — `RecordFeeCollectionHybrid` Has No Idempotency Guard
+
+**Severity**: Informational | **Status**: Open (known design decision)
+
+`RecordFeeCollectionHybrid` is a `nonconsuming` choice with no check that a fee was actually collected or that the marker hasn't been recorded before. It can be exercised multiple times by the `provider` party, which could inflate CIP-0104 activity marker rewards.
+
+**Assessment**: Blast radius is limited to inflated validator rewards — no fund movement is possible through this choice. The `nonconsuming` pattern is consistent with the other activity marker choices (`AcknowledgeDisbursementHybrid`, `RecordCollateralReturnHybrid`). Recommend adding a boolean flag `feeRecorded : Bool` to `ActiveLoanHybrid` to guard against re-exercise in a future DAML version.
+
+---
+
+## Known Issues
+
+---
+
+### PA-KI-1 — Multi-Step Flows Are Not Atomic
+
+**Severity**: ⚠️ Known Issue | **Status**: Open (planned)
+
+The loan lifecycle involves multiple sequential Canton transactions and external API calls that cannot be made atomic at the backend layer. A failure partway through any flow leaves the system in a partially-completed state.
+
+**Affected flows and failure scenarios:**
+
+| Flow | Step that fails | Consequence |
+|------|----------------|-------------|
+| BorrowerBid offer creation | CC locked → loan offer creation fails | CC stuck in admin escrow indefinitely |
+| Acceptance | `AcceptHybrid` succeeds → USDCx disbursement fails | Loan active on-chain, borrower never receives funds |
+| Acceptance | USDCx disbursed → fee collection fails | Lender short the fee; no automatic recovery |
+| Repayment | `RepayHybrid` succeeds → CC return fails | Borrower repaid USDCx but never recovers CC collateral |
+
+**Root cause**: True atomicity across multiple Canton transactions is not achievable at the API layer. The DA token standard (`TransferFactory_Transfer`) cannot be invoked from within our DAML choices, preventing a single-transaction design.
+
+**Planned mitigations:**
+1. **Compensation on CC lock failure** — if offer creation fails after CC lock, immediately return CC to borrower
+2. **Retry queue for CC return** — persist failed CC return operations to DB; background job retries with deterministic deduplication IDs (already in place)
+3. **Monitoring + alerting** — structured logging (LOW-3) will surface partial failures for manual intervention
+
+**Current state**: Critical financial steps (CC lock, USDCx transfer, CC return) log detailed errors. The deduplication hardening (PA-LOW-2) ensures retries are safe. Activity markers are non-fatal and do not block financial flows.
 
 ---
 
@@ -408,25 +274,42 @@ The DAML contracts (`ActiveLoanHybrid`, `LoanOfferHybrid`, `SettledLoan`, `Defau
 
 ---
 
+## Post-Audit Changes Summary
+
+The following improvements were made after the initial audit report (2026-04-02 → 2026-04-05):
+
+### DAML (v0.5.0 → v0.6.0)
+- Added `RecordFeeCollectionHybrid` — 6th CIP-0104 activity marker (nonconsuming, controller: `provider`)
+
+### Backend (`daml.service.ts`)
+- **Canton transaction batching**: reduced from 8 to 4 Canton transactions per full loan lifecycle
+  - Offer creation: `CreateAndExercise` (create `LoanOfferHybrid` + `RegisterOfferHybrid` in one tx)
+  - Acceptance: `AcknowledgeDisbursementHybrid` + `RecordFeeCollectionHybrid` batched in one tx
+  - Repayment: `RecordCollateralReturnHybrid` + `RepayHybrid` batched in one tx
+  - Default: `RecordCollateralReturnHybrid` + `ClaimDefaultHybrid` batched in one tx
+- **USDCx TransferPreapproval**: eliminates `TransferInstruction_Accept` Canton transaction for fee, disbursement, and repayment transfers when parties have pre-approval. `rhein-fees` pre-approval auto-created on startup.
+- **CC TransferPreapproval**: uses `POST /wallet/transfer-preapproval/send` (direct atomic transfer) instead of `TransferOffer` + explicit accept when receiver has `Splice.AmuletRules:TransferPreapproval`. Admin pre-approval auto-created on startup.
+- **Package IDs moved to env vars**: `USDCX_REGISTRY_APP_PACKAGE_ID` and `USDCX_HOLDING_PACKAGE_ID` (mainnet values differ from testnet)
+- **Deterministic deduplication IDs**: CC preapproval transfers use offer/loan contract ID as `deduplication_id` instead of random value
+
+---
+
 ## Recommended Fix Priority
 
 ### Immediate (before any external users)
-1. **CRIT-1** — Fetch offer from ledger in `acceptLoanOffer`, discard client payload for financial logic
-2. **CRIT-2** — Remove `claimDate` from DTO or restrict to admin role
-3. **HIGH-1** — Add `ThrottlerGuard` to global providers
+- ✅ CRIT-1, CRIT-2, HIGH-1 — resolved
 
 ### Before External Audit
-4. **HIGH-2** — Restrict explorer endpoints to authenticated users
-5. **HIGH-3** — Add confirmation safeguard to database clear
-6. **MED-1** — Set `forbidNonWhitelisted: true`
-7. **MED-4** — Add `@Min` to `repaymentAmount`
-8. **MED-5** — Disable Swagger in production
+- ✅ HIGH-2, HIGH-3, MED-1 through MED-5 — resolved
+- Open: MED-6, LOW-1 through LOW-4
 
 ### Before Mainnet Launch
-9. All remaining medium and low findings
-10. Structured logging implementation
-11. TypeORM migration setup (replace `synchronize`)
-12. External professional smart contract and API security audit
+- PA-KI-1 — implement compensation + retry queue for partial flow failures
+- PA-INFO-2 — add `feeRecorded` guard to `RecordFeeCollectionHybrid` in DAML v0.7.0
+- PA-LOW-1 — startup health check for preapproval state
+- Structured logging (LOW-3)
+- TypeORM migration setup (MED-6)
+- External professional smart contract and API security audit
 
 ---
 
