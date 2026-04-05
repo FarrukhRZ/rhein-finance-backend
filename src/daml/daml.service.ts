@@ -752,6 +752,7 @@ export class DamlService implements OnModuleInit {
     lockHolder: string,
     expiresAt: string,
     userToken?: string,
+    deduplicationId?: string,
   ): Promise<string> {
     // Verify sufficient CC balance first
     const amulets = await this.queryAmulets(partyId);
@@ -767,6 +768,9 @@ export class DamlService implements OnModuleInit {
     console.log(`[Amulet Lock] Locking ${amount} CC for ${partyId.split('::')[0]} (balance: ${totalCC.toFixed(4)} CC)`);
 
     const trackingId = `collateral-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    // Use caller-supplied deduplicationId (e.g. offer contract ID) for idempotency;
+    // fall back to a deterministic hash of the inputs so retries don't double-lock.
+    const dedupId = deduplicationId ?? `${partyId}-${amount}-${expiresAt}`;
 
     // Check if admin (receiver) has a CC TransferPreapproval.
     // If so, use the direct preapproval transfer — atomic, no separate accept needed.
@@ -782,11 +786,12 @@ export class DamlService implements OnModuleInit {
         amount: amount.toString(),
         description: `Loan collateral: ${amount} CC locked until ${expiresAt}`,
         tracking_id: trackingId,
-        deduplication_id: trackingId,
+        deduplication_id: dedupId,
       }, userToken);
-      // Direct preapproval transfer has no offer contract ID — use tracking ID as reference
+      // Preapproval send has no offer contract ID — store transaction_id as audit reference only.
+      // No downstream code exercises choices on this value.
       offerContractId = result.transaction_id ?? trackingId;
-      console.log(`[Amulet Lock] CC collateral transferred directly to admin (tracking: ${trackingId})`);
+      console.log(`[Amulet Lock] CC collateral transferred directly to admin (audit ref: ${offerContractId})`);
     } else {
       const expiresAtMicros = new Date(expiresAt).getTime() * 1000;
       const result = await this.walletApiFetch('transfer-offers', 'POST', {
@@ -809,10 +814,11 @@ export class DamlService implements OnModuleInit {
    * Return CC collateral from admin escrow to a recipient (borrower on repay, lender on default).
    * Uses direct preapproval transfer if recipient has CC TransferPreapproval, otherwise TransferOffer + accept.
    */
-  async returnCCCollateral(recipientPartyId: string, amount: number, recipientUserToken?: string): Promise<void> {
+  async returnCCCollateral(recipientPartyId: string, amount: number, recipientUserToken?: string, deduplicationId?: string): Promise<void> {
     console.log(`[Amulet Return] Sending ${amount} CC from admin escrow to ${recipientPartyId.split('::')[0]}`);
 
     const trackingId = `collateral-return-${Date.now()}`;
+    const dedupId = deduplicationId ?? trackingId;
 
     // Check if recipient has a CC TransferPreapproval.
     // If so, use the direct preapproval transfer — atomic, no separate accept needed.
@@ -826,7 +832,7 @@ export class DamlService implements OnModuleInit {
         amount: amount.toString(),
         description: `Collateral return: ${amount} CC`,
         tracking_id: trackingId,
-        deduplication_id: trackingId,
+        deduplication_id: dedupId,
       });
       console.log(`[Amulet Return] CC collateral transferred directly to ${recipientPartyId.split('::')[0]}`);
     } else {
@@ -896,6 +902,8 @@ export class DamlService implements OnModuleInit {
         this.adminPartyId,
         expiresAt,
         userToken,
+        // No offer contract ID yet (offer created after lock) — deduplicate on stable inputs
+        `lock-${partyId}-${offer.collateralAmount}-${offer.maturityDate}`,
       );
     }
     // LenderAsk: no upfront locking needed — lender disburses USDCx off-chain after acceptance
@@ -961,6 +969,8 @@ export class DamlService implements OnModuleInit {
         this.adminPartyId,
         expiresAt,
         userToken,
+        // Offer contract ID is known at accept time — fully deterministic
+        `lock-${offerContractId}`,
       );
     }
     // BorrowerBid: lender (acceptor) provides no upfront lock — disburses USDCx off-chain below
@@ -1154,7 +1164,7 @@ export class DamlService implements OnModuleInit {
     const collateralAmount = parseFloat(loan.payload.collateralAmount || '0');
     if (collateralAmount > 0) {
       try {
-        await this.returnCCCollateral(partyId, collateralAmount, userToken);
+        await this.returnCCCollateral(partyId, collateralAmount, userToken, `return-${loanContractId}`);
       } catch (unlockErr) {
         console.error(`[Amulet] Failed to return CC collateral: ${unlockErr}`);
         // Don't fail the whole repayment — DAML settlement succeeded
@@ -1216,7 +1226,7 @@ export class DamlService implements OnModuleInit {
     if (collateralAmount > 0) {
       try {
         console.log(`[Amulet] Sending CC collateral to lender ${partyId} after default`);
-        await this.returnCCCollateral(partyId, collateralAmount, userToken);
+        await this.returnCCCollateral(partyId, collateralAmount, userToken, `return-${loanContractId}`);
         console.log(`[Amulet] CC collateral successfully transferred to lender`);
       } catch (claimErr) {
         console.error(`[Amulet] Failed to claim CC collateral: ${claimErr}`);
