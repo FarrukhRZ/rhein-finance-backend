@@ -2,6 +2,7 @@ import { Module } from '@nestjs/common';
 import { ConfigModule, ConfigService } from '@nestjs/config';
 import { TypeOrmModule } from '@nestjs/typeorm';
 import { ThrottlerModule, ThrottlerGuard } from '@nestjs/throttler';
+import { ScheduleModule } from '@nestjs/schedule';
 import { APP_GUARD } from '@nestjs/core';
 import { AuthModule } from './auth/auth.module';
 import { UsersModule } from './users/users.module';
@@ -43,6 +44,9 @@ import { RolesGuard } from './auth/guards/roles.guard';
       ttl: 60000, // 1 minute
       limit: 100, // 100 requests per minute
     }]),
+
+    // Cron jobs (marker batch, etc.)
+    ScheduleModule.forRoot(),
 
     // Feature modules
     AuthModule,

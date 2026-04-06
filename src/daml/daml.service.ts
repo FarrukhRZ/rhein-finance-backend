@@ -1,4 +1,5 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
+import { Cron, CronExpression } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import * as http from 'http';
 import * as https from 'https';
@@ -44,6 +45,8 @@ export class DamlService implements OnModuleInit {
   private usdcxContextCache: { factoryId: string; choiceContextData: any; disclosedContracts: any[]; cachedAt: number } | null = null;
   // Cached FeaturedAppRight contract ID (stable — only changes if re-issued by DSO)
   private featuredAppRightCidCache: { contractId: string; cachedAt: number } | null = null;
+  // Pending marker credits accumulated from loan lifecycle events; flushed every 5 min
+  private markerPendingCount = 0;
 
   constructor(private configService: ConfigService) {
     this.jsonApiUrl = this.configService.get('JSON_API_URL') || 'http://172.18.0.5:7575';
@@ -908,15 +911,8 @@ export class DamlService implements OnModuleInit {
     }
     // LenderAsk: no upfront locking needed — lender disburses USDCx off-chain after acceptance
 
-    // Fetch FeaturedAppRight CID upfront (non-fatal if not found)
-    let featuredAppRightCid: string | null = null;
-    try {
-      featuredAppRightCid = await this.getFeaturedAppRightContractId();
-    } catch (err) {
-      console.warn(`[FeaturedAppRight] Skipping offer marker: ${err}`);
-    }
-
     // Batch offer creation + RegisterOfferHybrid into a single Canton transaction
+    // (featuredAppRightCid omitted — markers are accumulated and flushed in batch every 5 min)
     const createResult = await this.submitCommand(
       [this.createAndExerciseCmd(
         this.templateId('LoanOfferHybrid:LoanOfferHybrid'),
@@ -936,12 +932,13 @@ export class DamlService implements OnModuleInit {
           observers: [this.providerPartyId],
         },
         'RegisterOfferHybrid',
-        { featuredAppRightCid },
+        { featuredAppRightCid: null },
       )],
       [this.providerPartyId, partyId],
     );
 
-    console.log(`[FeaturedAppRight] Offer creation + RegisterOfferHybrid submitted atomically`);
+    this.markerPendingCount += 1;
+    console.log(`[Marker] Offer creation credit accumulated (pending: ${this.markerPendingCount})`);
     return createResult;
   }
 
@@ -976,21 +973,18 @@ export class DamlService implements OnModuleInit {
     // BorrowerBid: lender (acceptor) provides no upfront lock — disburses USDCx off-chain below
 
     console.log(`Accepting offer ${offerContractId} as ${partyId} (initiator: ${offer.payload.initiator})`);
-    let featuredAppRightCidValue: string | null = null;
-    try {
-      featuredAppRightCidValue = await this.getFeaturedAppRightContractId();
-    } catch (err) {
-      console.warn(`[FeaturedAppRight] Could not fetch contract ID, skipping activity marker: ${err}`);
-    }
+    // featuredAppRightCid omitted — markers are accumulated and flushed in batch every 5 min
     const result = await this.submitCommand(
       [this.exerciseCmd(
         this.templateId('LoanOfferHybrid:LoanOfferHybrid'),
         offerContractId,
         'AcceptHybrid',
-        { acceptor: partyId, acceptorCCReference, featuredAppRightCid: featuredAppRightCidValue },
+        { acceptor: partyId, acceptorCCReference, featuredAppRightCid: null },
       )],
       [this.providerPartyId, offer.payload.initiator, partyId],
     );
+    this.markerPendingCount += 1;
+    console.log(`[Marker] Loan origination credit accumulated (pending: ${this.markerPendingCount})`);
 
     // Disburse USDCx from lender to borrower immediately after loan creation
     let disbursementResult: any = null;
@@ -1053,9 +1047,8 @@ export class DamlService implements OnModuleInit {
       }
 
       // Batch AcknowledgeDisbursementHybrid + RecordFeeCollectionHybrid into one transaction
+      // (featuredAppRightCid omitted — markers are accumulated and flushed in batch every 5 min)
       if (activeLoanContractId) {
-        let farCid: string | null = null;
-        try { farCid = await this.getFeaturedAppRightContractId(); } catch (_) {}
         try {
           await this.submitCommand(
             [
@@ -1063,20 +1056,21 @@ export class DamlService implements OnModuleInit {
                 this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
                 activeLoanContractId,
                 'AcknowledgeDisbursementHybrid',
-                { featuredAppRightCid: farCid },
+                { featuredAppRightCid: null },
               ),
               this.exerciseCmd(
                 this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
                 activeLoanContractId,
                 'RecordFeeCollectionHybrid',
-                { featuredAppRightCid: farCid },
+                { featuredAppRightCid: null },
               ),
             ],
             [this.providerPartyId],
           );
-          console.log(`[FeaturedAppRight] Disbursement + fee collection markers created (batched)`);
+          this.markerPendingCount += 2;
+          console.log(`[Marker] Disbursement + fee collection credits accumulated (pending: ${this.markerPendingCount})`);
         } catch (err) {
-          console.warn(`[FeaturedAppRight] Batched disbursement/fee markers failed (non-fatal): ${err}`);
+          console.warn(`[Marker] Disbursement/fee DAML commands failed (non-fatal): ${err}`);
         }
       }
     } catch (err: any) {
@@ -1132,33 +1126,27 @@ export class DamlService implements OnModuleInit {
       }
     }
 
-    // Step 3: RepayHybrid requires provider, borrower, and lender to sign.
-    let featuredAppRightCidRepay: string | null = null;
-    try {
-      featuredAppRightCidRepay = await this.getFeaturedAppRightContractId();
-    } catch (err) {
-      console.warn(`[FeaturedAppRight] Could not fetch contract ID for repay, skipping activity marker: ${err}`);
-    }
-
     // Batch RecordCollateralReturnHybrid (nonconsuming) + RepayHybrid (consuming) in one transaction
+    // (featuredAppRightCid omitted — markers are accumulated and flushed in batch every 5 min)
     const repayResult = await this.submitCommand(
       [
         this.exerciseCmd(
           this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
           loanContractId,
           'RecordCollateralReturnHybrid',
-          { featuredAppRightCid: featuredAppRightCidRepay },
+          { featuredAppRightCid: null },
         ),
         this.exerciseCmd(
           this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
           loanContractId,
           'RepayHybrid',
-          { repaymentDate: today, repaymentAmount: repaymentAmount.toString(), featuredAppRightCid: featuredAppRightCidRepay },
+          { repaymentDate: today, repaymentAmount: repaymentAmount.toString(), featuredAppRightCid: null },
         ),
       ],
       [this.providerPartyId, partyId, lender],
     );
-    console.log(`[FeaturedAppRight] Collateral return + repayment submitted (batched)`);
+    this.markerPendingCount += 2;
+    console.log(`[Marker] Collateral return + repayment credits accumulated (pending: ${this.markerPendingCount})`);
 
     // Return CC collateral from admin escrow back to the borrower
     const collateralAmount = parseFloat(loan.payload.collateralAmount || '0');
@@ -1194,32 +1182,27 @@ export class DamlService implements OnModuleInit {
     const borrower = loan.payload.borrower;
     console.log(`Claiming default on loan ${loanContractId} - Lender: ${partyId}, Borrower: ${borrower}`);
 
-    let featuredAppRightCidDefault: string | null = null;
-    try {
-      featuredAppRightCidDefault = await this.getFeaturedAppRightContractId();
-    } catch (err) {
-      console.warn(`[FeaturedAppRight] Could not fetch contract ID for default, skipping activity marker: ${err}`);
-    }
-
     // Batch RecordCollateralReturnHybrid (nonconsuming) + ClaimDefaultHybrid (consuming) in one transaction
+    // (featuredAppRightCid omitted — markers are accumulated and flushed in batch every 5 min)
     const defaultResult = await this.submitCommand(
       [
         this.exerciseCmd(
           this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
           loanContractId,
           'RecordCollateralReturnHybrid',
-          { featuredAppRightCid: featuredAppRightCidDefault },
+          { featuredAppRightCid: null },
         ),
         this.exerciseCmd(
           this.templateId('ActiveLoanHybrid:ActiveLoanHybrid'),
           loanContractId,
           'ClaimDefaultHybrid',
-          { claimDate, featuredAppRightCid: featuredAppRightCidDefault },
+          { claimDate, featuredAppRightCid: null },
         ),
       ],
       [this.providerPartyId, partyId, borrower],
     );
-    console.log(`[FeaturedAppRight] Collateral return + default claim submitted (batched)`);
+    this.markerPendingCount += 2;
+    console.log(`[Marker] Collateral return + default credits accumulated (pending: ${this.markerPendingCount})`);
 
     // Send CC collateral from admin escrow to the lender as penalty
     const collateralAmount = parseFloat(loan.payload.collateralAmount || '0');
@@ -1937,6 +1920,58 @@ export class DamlService implements OnModuleInit {
         totalCC: appCoupons.reduce((s: number, c: any) => s + parseFloat(c?.createArgument?.amount || '0'), 0),
       },
     };
+  }
+
+  // ============================================================================
+  // FEATURED APP MARKER BATCH JOB (CIP-0104)
+  // ============================================================================
+
+  /**
+   * Flush accumulated marker credits as a single batch transaction every 5 minutes.
+   *
+   * Rather than firing one ActivityMarker per loan lifecycle event (which risks
+   * submitting more markers than our CC burn justifies), we accumulate credits and
+   * submit them in one transaction. This keeps the Canton transaction overhead low
+   * and makes it easy to cap or calibrate the rate against actual burn data later.
+   *
+   * Safety cap: MAX_MARKERS_PER_BATCH — never fire more than this many markers in
+   * a single run. Any overflow stays in the pending counter for the next run.
+   */
+  @Cron(CronExpression.EVERY_5_MINUTES)
+  async flushMarkerBatch(): Promise<void> {
+    const MAX_MARKERS_PER_BATCH = 10;
+
+    if (this.markerPendingCount <= 0) return;
+
+    let farCid: string;
+    try {
+      farCid = await this.getFeaturedAppRightContractId();
+    } catch (err) {
+      console.warn(`[MarkerBatch] FeaturedAppRight not available, skipping flush: ${err}`);
+      return;
+    }
+
+    const toFire = Math.min(this.markerPendingCount, MAX_MARKERS_PER_BATCH);
+    this.markerPendingCount -= toFire;
+
+    const FEATURED_APP_RIGHT_INTERFACE = '7804375fe5e4c6d5afe067bd314c42fe0b7d005a1300019c73154dd939da4dda:Splice.Api.FeaturedAppRightV1:FeaturedAppRight';
+    const markerCommands = Array.from({ length: toFire }, () =>
+      this.exerciseCmd(
+        FEATURED_APP_RIGHT_INTERFACE,
+        farCid,
+        'FeaturedAppRight_CreateActivityMarker',
+        { beneficiaries: [{ beneficiary: this.providerPartyId, weight: 1.0 }] },
+      ),
+    );
+
+    try {
+      await this.submitCommand(markerCommands, [this.providerPartyId]);
+      console.log(`[MarkerBatch] Flushed ${toFire} activity markers (remaining pending: ${this.markerPendingCount})`);
+    } catch (err) {
+      // Restore credits so they're retried next run
+      this.markerPendingCount += toFire;
+      console.warn(`[MarkerBatch] Failed to flush markers, will retry next run: ${err}`);
+    }
   }
 
   // ============================================================================
