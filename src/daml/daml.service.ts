@@ -38,6 +38,9 @@ export class DamlService implements OnModuleInit {
   private readonly providerPartyId: string;
   private readonly usdcxRegistryAppPackageId: string;
   private readonly usdcxHoldingPackageId: string;
+  private readonly scanApiUrl: string;
+  private readonly scanMemberId: string;
+  private readonly scanSynchronizerId: string;
 
   // Cached Auth0 tokens (keyed by audience)
   private tokenCache: Map<string, { token: string; expiresAt: number }> = new Map();
@@ -47,6 +50,10 @@ export class DamlService implements OnModuleInit {
   private featuredAppRightCidCache: { contractId: string; cachedAt: number } | null = null;
   // Pending marker credits accumulated from loan lifecycle events; flushed every 5 min
   private markerPendingCount = 0;
+  // Rolling 30-min history of traffic readings (one per 5-min cron run, max 7 entries)
+  private trafficHistory: { timestamp: number; consumed: number }[] = [];
+  // Rolling 30-min history of markers submitted (for overage calculation)
+  private markerHistory: { timestamp: number; count: number }[] = [];
 
   constructor(private configService: ConfigService) {
     this.jsonApiUrl = this.configService.get('JSON_API_URL') || 'http://172.18.0.5:7575';
@@ -72,6 +79,9 @@ export class DamlService implements OnModuleInit {
     this.providerPartyId = this.configService.get('PROVIDER_PARTY_ID') || this.adminPartyId;
     this.usdcxRegistryAppPackageId = this.configService.get('USDCX_REGISTRY_APP_PACKAGE_ID') || '661151768d69141dfd6b757bdc348012b2a64b2c956ad586782f97d07408f264';
     this.usdcxHoldingPackageId = this.configService.get('USDCX_HOLDING_PACKAGE_ID') || 'dd3a9f2d51cc4c52d9ec2e1d7ff235298dcfb3afd1d50ab44328b1aaa9a18587';
+    this.scanApiUrl = this.configService.get('SCAN_API_URL') || 'https://scan.sv-1.global.canton.network.sync.global/api/scan';
+    this.scanMemberId = this.configService.get('SCAN_MEMBER_ID') || 'PAR::rheinfin-validator-1::1220d30d92d761e873a8ddef9f72307ad0a51704080ea3292df1173a6e073491ee47';
+    this.scanSynchronizerId = this.configService.get('SCAN_SYNCHRONIZER_ID') || 'global-domain::1220b1431ef217342db44d516bb9befde802be7d8899637d290895fa58880f19accc';
   }
 
   async onModuleInit() {
@@ -905,8 +915,9 @@ export class DamlService implements OnModuleInit {
         this.adminPartyId,
         expiresAt,
         userToken,
-        // No offer contract ID yet (offer created after lock) — deduplicate on stable inputs
-        `lock-${partyId}-${offer.collateralAmount}-${offer.maturityDate}`,
+        // No offer contract ID yet — use a time-bucketed key (10-min window) so retries
+        // within the same attempt are idempotent but a new offer attempt gets a fresh dedup ID.
+        `lock-${partyId}-${offer.collateralAmount}-${offer.maturityDate}-${Math.floor(Date.now() / 600000)}`,
       );
     }
     // LenderAsk: no upfront locking needed — lender disburses USDCx off-chain after acceptance
@@ -1927,21 +1938,91 @@ export class DamlService implements OnModuleInit {
   // ============================================================================
 
   /**
-   * Flush accumulated marker credits as a single batch transaction every 5 minutes.
+   * Query the Scan API for our validator's current total traffic consumed.
+   * Returns null on failure (non-fatal — cron will skip burn check and use safety cap).
+   */
+  private async getScanTrafficConsumed(): Promise<number | null> {
+    return new Promise((resolve) => {
+      const url = new URL(`${this.scanApiUrl}/v0/domains/${this.scanSynchronizerId}/members/${encodeURIComponent(this.scanMemberId)}/traffic-status`);
+      const lib = url.protocol === 'https:' ? https : http;
+      const req = lib.get(url.toString(), { timeout: 5000 }, (res) => {
+        let body = '';
+        res.on('data', (chunk) => body += chunk);
+        res.on('end', () => {
+          try {
+            const data = JSON.parse(body);
+            resolve(data?.traffic_status?.actual?.total_consumed ?? null);
+          } catch {
+            resolve(null);
+          }
+        });
+      });
+      req.on('error', () => resolve(null));
+      req.on('timeout', () => { req.destroy(); resolve(null); });
+    });
+  }
+
+  /**
+   * Flush accumulated marker credits every 5 minutes, calibrated to actual burn.
    *
-   * Rather than firing one ActivityMarker per loan lifecycle event (which risks
-   * submitting more markers than our CC burn justifies), we accumulate credits and
-   * submit them in one transaction. This keeps the Canton transaction overhead low
-   * and makes it easy to cap or calibrate the rate against actual burn data later.
+   * Algorithm (FA Marker Guidance §2 compliant):
+   * 1. Read current `total_consumed` from Scan API traffic-status.
+   * 2. Compute 30-min burn delta from rolling history (6 readings × 5 min).
+   * 3. Convert traffic units → USD: units × $0.000443/unit (≈ $505/1.14MB mainnet rate).
+   * 4. Subtract markers already submitted in the same 30-min window.
+   * 5. Flush min(pending, floor(allowed)) markers in one batch transaction.
    *
-   * Safety cap: MAX_MARKERS_PER_BATCH — never fire more than this many markers in
-   * a single run. Any overflow stays in the pending counter for the next run.
+   * If Scan API is unreachable, falls back to a conservative safety cap of 10/run.
+   * Any unfired credits carry over to the next run (two-round rule: 5-min cron is
+   * well within the ~10-min round window).
    */
   @Cron(CronExpression.EVERY_5_MINUTES)
   async flushMarkerBatch(): Promise<void> {
-    const MAX_MARKERS_PER_BATCH = 10;
+    // USD value per traffic unit — derived from mainnet purchase rate ($505.19 / 1,140,000 units)
+    const USD_PER_TRAFFIC_UNIT = 0.000443;
+    const WINDOW_MS = 30 * 60 * 1000; // 30-minute compliance window
+    const FALLBACK_CAP = 10;          // conservative cap when Scan API is unavailable
+    const now = Date.now();
 
     if (this.markerPendingCount <= 0) return;
+
+    // Step 1: Read current traffic consumed from Scan API
+    const currentConsumed = await this.getScanTrafficConsumed();
+
+    // Step 2: Update rolling history and compute 30-min burn delta
+    let allowedMarkers: number;
+    if (currentConsumed !== null) {
+      // Trim to last 35 minutes before pushing so oldest is always a prior reading
+      this.trafficHistory = this.trafficHistory.filter(r => now - r.timestamp <= 35 * 60 * 1000);
+      const oldest = this.trafficHistory.length > 0 ? this.trafficHistory[0] : null;
+      this.trafficHistory.push({ timestamp: now, consumed: currentConsumed });
+
+      if (!oldest) {
+        // First reading — no baseline yet, use fallback cap and wait for next run
+        console.log(`[MarkerBatch] First traffic reading (${currentConsumed.toLocaleString()} units), using fallback cap of ${FALLBACK_CAP} until 30-min baseline established`);
+        allowedMarkers = FALLBACK_CAP;
+      } else {
+        const burnDelta = Math.max(0, currentConsumed - oldest.consumed);
+        const usdBurn = burnDelta * USD_PER_TRAFFIC_UNIT;
+
+        // Step 3: Count markers already submitted in the 30-min window
+        this.markerHistory = this.markerHistory.filter(r => now - r.timestamp <= WINDOW_MS);
+        const alreadySubmitted = this.markerHistory.reduce((sum, r) => sum + r.count, 0);
+
+        allowedMarkers = Math.max(0, Math.floor(usdBurn) - alreadySubmitted);
+        console.log(`[MarkerBatch] Burn last 30min: ${burnDelta.toLocaleString()} units ≈ $${usdBurn.toFixed(2)} → allowed: ${allowedMarkers}, already submitted: ${alreadySubmitted}, pending: ${this.markerPendingCount}`);
+      }
+    } else {
+      // Scan API unavailable — fall back to conservative cap
+      console.warn(`[MarkerBatch] Scan API unavailable, using fallback cap of ${FALLBACK_CAP}`);
+      allowedMarkers = FALLBACK_CAP;
+    }
+
+    const toFire = Math.min(this.markerPendingCount, allowedMarkers);
+    if (toFire <= 0) {
+      console.log(`[MarkerBatch] No markers allowed this run (pending: ${this.markerPendingCount})`);
+      return;
+    }
 
     let farCid: string;
     try {
@@ -1951,7 +2032,6 @@ export class DamlService implements OnModuleInit {
       return;
     }
 
-    const toFire = Math.min(this.markerPendingCount, MAX_MARKERS_PER_BATCH);
     this.markerPendingCount -= toFire;
 
     const FEATURED_APP_RIGHT_INTERFACE = '7804375fe5e4c6d5afe067bd314c42fe0b7d005a1300019c73154dd939da4dda:Splice.Api.FeaturedAppRightV1:FeaturedAppRight';
@@ -1966,9 +2046,9 @@ export class DamlService implements OnModuleInit {
 
     try {
       await this.submitCommand(markerCommands, [this.providerPartyId]);
+      this.markerHistory.push({ timestamp: now, count: toFire });
       console.log(`[MarkerBatch] Flushed ${toFire} activity markers (remaining pending: ${this.markerPendingCount})`);
     } catch (err) {
-      // Restore credits so they're retried next run
       this.markerPendingCount += toFire;
       console.warn(`[MarkerBatch] Failed to flush markers, will retry next run: ${err}`);
     }
