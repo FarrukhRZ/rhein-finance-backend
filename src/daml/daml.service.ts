@@ -1,5 +1,5 @@
 import { Injectable, OnModuleInit } from '@nestjs/common';
-import { Cron, CronExpression } from '@nestjs/schedule';
+import { Cron } from '@nestjs/schedule';
 import { ConfigService } from '@nestjs/config';
 import * as http from 'http';
 import * as https from 'https';
@@ -41,6 +41,8 @@ export class DamlService implements OnModuleInit {
   private readonly scanApiUrl: string;
   private readonly scanMemberId: string;
   private readonly scanSynchronizerId: string;
+  private readonly cmcApiKey: string;
+  private readonly cmcCoinId: string;
 
   // Cached Auth0 tokens (keyed by audience)
   private tokenCache: Map<string, { token: string; expiresAt: number }> = new Map();
@@ -56,6 +58,8 @@ export class DamlService implements OnModuleInit {
   private markerHistory: { timestamp: number; count: number }[] = [];
   // Cached BatchedMarkersProxy contract ID
   private batchedMarkersProxyCid: string | null = null;
+  // Cached CC price fetched from OpenMiningRound (refreshed every 5 min)
+  private ccPriceCache: number | null = null;
 
   constructor(private configService: ConfigService) {
     this.jsonApiUrl = this.configService.get('JSON_API_URL') || 'http://172.18.0.5:7575';
@@ -84,6 +88,8 @@ export class DamlService implements OnModuleInit {
     this.scanApiUrl = this.configService.get('SCAN_API_URL') || 'https://scan.sv-1.global.canton.network.sync.global/api/scan';
     this.scanMemberId = this.configService.get('SCAN_MEMBER_ID') || 'PAR::rheinfin-validator-1::1220d30d92d761e873a8ddef9f72307ad0a51704080ea3292df1173a6e073491ee47';
     this.scanSynchronizerId = this.configService.get('SCAN_SYNCHRONIZER_ID') || 'global-domain::1220b1431ef217342db44d516bb9befde802be7d8899637d290895fa58880f19accc';
+    this.cmcApiKey = this.configService.get('CMC_API_KEY') || '';
+    this.cmcCoinId = this.configService.get('CMC_COIN_ID') || '37263'; // Canton Coin (canton-network) CMC ID
   }
 
   async onModuleInit() {
@@ -974,7 +980,7 @@ export class DamlService implements OnModuleInit {
           interestRate: offer.interestRate,
           maturityDate: offer.maturityDate,
           ltvRatio: this.defaultLtv.toString(),
-          ccPrice: this.ccPrice.toString(),
+          ccPrice: this.getCCPrice().toString(),
           createdAt: today,
           observers: [this.providerPartyId],
         },
@@ -1970,6 +1976,43 @@ export class DamlService implements OnModuleInit {
   }
 
   // ============================================================================
+  // CC PRICE (CoinMarketCap API)
+  // ============================================================================
+
+  /**
+   * Fetch the current CC/USD price from CoinMarketCap.
+   * Uses the CMC_API_KEY env var. Returns null on failure.
+   */
+  private async fetchCCPriceFromCMC(): Promise<number | null> {
+    if (!this.cmcApiKey) return null;
+    try {
+      const response = await this.customFetch(
+        `https://pro-api.coinmarketcap.com/v2/cryptocurrency/quotes/latest?id=${this.cmcCoinId}&convert=USD`,
+        {
+          method: 'GET',
+          headers: {
+            'X-CMC_PRO_API_KEY': this.cmcApiKey,
+            'Accept': 'application/json',
+          },
+        },
+      );
+      if (!response.ok) return null;
+      const data = await response.json();
+      const price = data?.data?.[this.cmcCoinId]?.[0]?.quote?.USD?.price
+        ?? data?.data?.[this.cmcCoinId]?.quote?.USD?.price
+        ?? null;
+      return price ? parseFloat(price) : null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Returns the current CC price — live if available, falls back to configured default. */
+  getCCPrice(): number {
+    return this.ccPriceCache ?? this.ccPrice;
+  }
+
+  // ============================================================================
   // FEATURED APP MARKER BATCH JOB (CIP-0104)
   // ============================================================================
 
@@ -2012,7 +2055,16 @@ export class DamlService implements OnModuleInit {
    * Any unfired credits carry over to the next run (two-round rule: 5-min cron is
    * well within the ~10-min round window).
    */
-  @Cron(CronExpression.EVERY_5_MINUTES)
+  @Cron('*/30 * * * * *')
+  async refreshCCPrice(): Promise<void> {
+    const freshPrice = await this.fetchCCPriceFromCMC();
+    if (freshPrice !== null) {
+      this.ccPriceCache = freshPrice;
+      console.log(`[CCPrice] Updated to $${freshPrice.toFixed(4)} from CoinMarketCap`);
+    }
+  }
+
+  @Cron('0 */5 * * * *')
   async flushMarkerBatch(): Promise<void> {
     // USD value per traffic unit — derived from mainnet purchase rate ($505.19 / 1,140,000 units)
     const USD_PER_TRAFFIC_UNIT = 0.000443;
