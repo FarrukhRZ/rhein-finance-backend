@@ -54,6 +54,8 @@ export class DamlService implements OnModuleInit {
   private trafficHistory: { timestamp: number; consumed: number }[] = [];
   // Rolling 30-min history of markers submitted (for overage calculation)
   private markerHistory: { timestamp: number; count: number }[] = [];
+  // Cached BatchedMarkersProxy contract ID
+  private batchedMarkersProxyCid: string | null = null;
 
   constructor(private configService: ConfigService) {
     this.jsonApiUrl = this.configService.get('JSON_API_URL') || 'http://172.18.0.5:7575';
@@ -100,6 +102,40 @@ export class DamlService implements OnModuleInit {
     } catch (err) {
       console.warn(`[Startup] Failed to ensure CC TransferPreapproval for admin party: ${err}`);
     }
+
+    // Create or fetch the BatchedMarkersProxy contract for efficient V2 batch marker submission.
+    try {
+      this.batchedMarkersProxyCid = await this.ensureBatchedMarkersProxy();
+      console.log(`[Startup] BatchedMarkersProxy ready: ${this.batchedMarkersProxyCid}`);
+    } catch (err) {
+      console.warn(`[Startup] Failed to ensure BatchedMarkersProxy (will fall back to single markers): ${err}`);
+    }
+  }
+
+  private readonly BATCHED_MARKERS_PROXY_TEMPLATE = '4d91a9b044e0e996e91ee9aac3442591ffc78f16da4ff5c6f55218ba667f6192:Splice.Util.FeaturedApp.BatchedMarkersProxy:BatchedMarkersProxy';
+  private readonly FAR_V2_INTERFACE = 'dd22e3e168a8c7fd0313171922dabf1f7a3b131bd9bfc9ff98e606f8c57707ea:Splice.Api.FeaturedAppRightV2:FeaturedAppRight';
+
+  private async ensureBatchedMarkersProxy(): Promise<string> {
+    // Check if one already exists
+    const existing = await this.queryContracts([this.BATCHED_MARKERS_PROXY_TEMPLATE], [this.providerPartyId]);
+    if (existing.length > 0) {
+      console.log(`[Startup] BatchedMarkersProxy already exists`);
+      return existing[0].contractId;
+    }
+
+    // Create one
+    const dsoPartyId = this.configService.get('DSO_PARTY_ID') || '';
+    const result = await this.submitCommand(
+      [this.createCmd(this.BATCHED_MARKERS_PROXY_TEMPLATE, {
+        provider: this.providerPartyId,
+        dso: dsoPartyId,
+      })],
+      [this.providerPartyId],
+    );
+    const contractId = this.getCreatedContractId(result, 'BatchedMarkersProxy');
+    if (!contractId) throw new Error('BatchedMarkersProxy creation returned no contract ID');
+    console.log(`[Startup] BatchedMarkersProxy created: ${contractId}`);
+    return contractId;
   }
 
   private async hasTransferPreapproval(partyId: string): Promise<boolean> {
@@ -2034,20 +2070,37 @@ export class DamlService implements OnModuleInit {
 
     this.markerPendingCount -= toFire;
 
-    const FEATURED_APP_RIGHT_INTERFACE = '7804375fe5e4c6d5afe067bd314c42fe0b7d005a1300019c73154dd939da4dda:Splice.Api.FeaturedAppRightV1:FeaturedAppRight';
-    const markerCommands = Array.from({ length: toFire }, () =>
-      this.exerciseCmd(
-        FEATURED_APP_RIGHT_INTERFACE,
-        farCid,
-        'FeaturedAppRight_CreateActivityMarker',
-        { beneficiaries: [{ beneficiary: this.providerPartyId, weight: 1.0 }] },
-      ),
-    );
-
     try {
-      await this.submitCommand(markerCommands, [this.providerPartyId]);
+      if (this.batchedMarkersProxyCid) {
+        // V2 batch: one Canton transaction, one marker with weight = toFire
+        await this.submitCommand(
+          [this.exerciseCmd(
+            this.BATCHED_MARKERS_PROXY_TEMPLATE,
+            this.batchedMarkersProxyCid,
+            'BatchedMarkersProxy_CreateMarkersV2',
+            {
+              featuredAppRightCid: farCid,
+              batches: [{ beneficiaries: [{ beneficiary: this.providerPartyId, weight: 1.0 }], markerWeight: toFire }],
+            },
+          )],
+          [this.providerPartyId],
+        );
+        console.log(`[MarkerBatch] Flushed ${toFire} marker weight via BatchV2 (remaining pending: ${this.markerPendingCount})`);
+      } else {
+        // Fallback: individual marker exercises (higher traffic cost)
+        const FEATURED_APP_RIGHT_INTERFACE = '7804375fe5e4c6d5afe067bd314c42fe0b7d005a1300019c73154dd939da4dda:Splice.Api.FeaturedAppRightV1:FeaturedAppRight';
+        const markerCommands = Array.from({ length: toFire }, () =>
+          this.exerciseCmd(
+            FEATURED_APP_RIGHT_INTERFACE,
+            farCid,
+            'FeaturedAppRight_CreateActivityMarker',
+            { beneficiaries: [{ beneficiary: this.providerPartyId, weight: 1.0 }] },
+          ),
+        );
+        await this.submitCommand(markerCommands, [this.providerPartyId]);
+        console.log(`[MarkerBatch] Flushed ${toFire} activity markers via fallback (remaining pending: ${this.markerPendingCount})`);
+      }
       this.markerHistory.push({ timestamp: now, count: toFire });
-      console.log(`[MarkerBatch] Flushed ${toFire} activity markers (remaining pending: ${this.markerPendingCount})`);
     } catch (err) {
       this.markerPendingCount += toFire;
       console.warn(`[MarkerBatch] Failed to flush markers, will retry next run: ${err}`);
